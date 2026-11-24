@@ -1,0 +1,9 @@
+TSEM: Tailscale Exit Manager for GL.iNet / OpenWrt routers
+Copyright 2026 mompl
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+"Tailscale" is a trademark of Tailscale Inc. "GL.iNet" is a trademark of GL Technologies (Hong Kong) Limited.
+"OpenWrt" is a trademark of the OpenWrt project. "Home Assistant" is a trademark of the Open Home Foundation.
+This project is independent and is not affiliated with, endorsed by or sponsored by any of them. The names are used only to say
+which products this software works with.

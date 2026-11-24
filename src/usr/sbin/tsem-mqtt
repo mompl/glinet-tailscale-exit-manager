@@ -1,0 +1,147 @@
+#!/bin/sh
+# tsem-mqtt - Home Assistant bridge (MQTT discovery). It ONLY talks to MQTT and to
+# the central controller (`tsem`). It never touches firewall rules or tailscale.
+#
+# Safety properties:
+#  - Commands are never retained and retained messages are ignored (mosquitto_sub -R),
+#    so a broker restart or a restart of this daemon cannot replay an old command as a
+#    new user action. Publishing state never calls `tsem set`.
+#  - The password is read from a separate file (mode 600) and handed to mosquitto via an
+#    options file in the (tmpfs) run dir, not via the command line.
+#  - Payloads are matched against exact tokens; anything else is ignored.
+#
+# Requires mosquitto-client (mosquitto_pub / mosquitto_sub, mosquitto >= 2.0).
+
+set -u
+umask 077
+TSEM_BIN=${TSEM_BIN:-/usr/sbin/tsem}
+MQTT_CONF=${MQTT_CONF:-/etc/tsem/mqtt.conf}
+RUN=${TSEM_RUN_DIR:-/var/run/tsem}
+PUB=${MOSQUITTO_PUB:-mosquitto_pub}
+SUB=${MOSQUITTO_SUB:-mosquitto_sub}
+
+lg() { printf 'tsem-mqtt: %s\n' "$*" >&2; command -v logger >/dev/null 2>&1 && [ "${TSEM_SYSLOG:-1}" = 1 ] && logger -t tsem-mqtt -- "$*"; return 0; }
+
+MQTT_HOST='' MQTT_PORT=1883 MQTT_USER='' MQTT_PASSFILE='' MQTT_TLS=0 MQTT_CAFILE=''
+MQTT_BASE=tsem/router MQTT_DISCOVERY=homeassistant MQTT_ID=router MQTT_INTERVAL=10
+
+load_conf() {
+	[ -r "$MQTT_CONF" ] || { lg "no $MQTT_CONF"; exit 2; }
+	while IFS= read -r l || [ -n "$l" ]; do
+		case $l in '' | '#'* | ' '*) continue ;; esac
+		k=${l%%=*}
+		v=${l#*=}
+		case $v in \"*\") v=${v#\"}; v=${v%\"} ;; esac
+		case $v in *'$'* | *'`'* | *';'* | *'|'* | *'&'* | *'<'* | *'>'* | *'('* | *')'* | *' '*) lg "ignored unsafe value for $k"; continue ;; esac
+		case $k in
+		MQTT_HOST) case $v in '' | *[!A-Za-z0-9.-]*) lg "bad $k" ;; *) MQTT_HOST=$v ;; esac ;;
+		MQTT_PORT | MQTT_INTERVAL) case $v in '' | *[!0-9]*) lg "bad $k" ;; *) eval "$k=\$v" ;; esac ;;
+		MQTT_USER) case $v in *[!A-Za-z0-9._@-]*) lg "bad $k" ;; *) MQTT_USER=$v ;; esac ;;
+		MQTT_PASSFILE | MQTT_CAFILE) case $v in '' | /*) case $v in *[!A-Za-z0-9./_-]*) lg "bad $k" ;; *) eval "$k=\$v" ;; esac ;; *) lg "bad $k" ;; esac ;;
+		MQTT_TLS) case $v in 0 | 1) MQTT_TLS=$v ;; *) lg "bad $k" ;; esac ;;
+		MQTT_BASE | MQTT_DISCOVERY | MQTT_ID) case $v in '' | *[!A-Za-z0-9/_-]*) lg "bad $k" ;; *) eval "$k=\$v" ;; esac ;;
+		*) lg "unknown key $k" ;;
+		esac
+	done <"$MQTT_CONF"
+	[ -n "$MQTT_HOST" ] || { lg "MQTT_HOST not set"; exit 2; }
+	[ "$MQTT_INTERVAL" -ge 2 ] || MQTT_INTERVAL=10
+}
+
+make_opts() {
+	mkdir -p "$RUN" || exit 1
+	OPTS=$RUN/mqtt.opts
+	: >"$OPTS" && chmod 600 "$OPTS"
+	{
+		printf -- '-h %s\n-p %s\n' "$MQTT_HOST" "$MQTT_PORT"
+		[ -z "$MQTT_USER" ] || printf -- '-u %s\n' "$MQTT_USER"
+		if [ -n "$MQTT_PASSFILE" ] && [ -r "$MQTT_PASSFILE" ]; then
+			pm=$(stat -c %a "$MQTT_PASSFILE" 2>/dev/null || echo 600)
+			case $pm in 600 | 400) ;; *) lg "WARNING: $MQTT_PASSFILE has mode $pm (should be 600)" ;; esac
+			printf -- '-P %s\n' "$(head -n 1 "$MQTT_PASSFILE")"
+		fi
+		[ "$MQTT_TLS" != 1 ] || { [ -z "$MQTT_CAFILE" ] || printf -- '--cafile %s\n' "$MQTT_CAFILE"; }
+	} >>"$OPTS"
+}
+
+pub() { # topic payload [retain]
+	if [ "${3:-0}" = 1 ]; then "$PUB" -o "$OPTS" -q 1 -r -t "$1" -m "$2"; else "$PUB" -o "$OPTS" -q 1 -t "$1" -m "$2"; fi
+}
+
+dev_json() {
+	printf '"device":{"identifiers":["tsem_%s"],"name":"GL.iNet Exit Manager (%s)","manufacturer":"tsem","model":"GL-MT3000"},"availability_topic":"%s/availability"' \
+		"$MQTT_ID" "$MQTT_ID" "$MQTT_BASE"
+}
+
+# disc TYPE OBJECT EXTRA_JSON_FIELDS
+disc() {
+	pub "$MQTT_DISCOVERY/$1/tsem_${MQTT_ID}/$2/config" \
+		"{\"unique_id\":\"tsem_${MQTT_ID}_$2\",\"object_id\":\"tsem_${MQTT_ID}_$2\",$3,$(dev_json)}" 1
+}
+
+publish_discovery() {
+	st="\"state_topic\":\"$MQTT_BASE/state\""
+	ex="\"expire_after\":$((MQTT_INTERVAL * 4))"
+	disc switch german_internet "\"name\":\"German Internet\",$st,\"value_template\":\"{{ 'ON' if value_json.mode == 'german' else 'OFF' }}\",\"command_topic\":\"$MQTT_BASE/cmd/german\",\"payload_on\":\"ON\",\"payload_off\":\"OFF\",\"qos\":1,\"retain\":false"
+	disc switch auto_failover "\"name\":\"Automatic Failover\",$st,\"value_template\":\"{{ 'ON' if value_json.failover == 'auto' else 'OFF' }}\",\"command_topic\":\"$MQTT_BASE/cmd/auto_failover\",\"payload_on\":\"ON\",\"payload_off\":\"OFF\",\"qos\":1,\"retain\":false"
+	disc button failover_now "\"name\":\"Failover Now\",\"command_topic\":\"$MQTT_BASE/cmd/failover_now\",\"payload_press\":\"PRESS\",\"qos\":1,\"retain\":false"
+	disc sensor state "\"name\":\"State\",$st,\"value_template\":\"{{ value_json.state }}\",$ex"
+	disc sensor active_exit "\"name\":\"Active Exit Node\",$st,\"value_template\":\"{{ value_json.active_exit }}\",$ex"
+	disc sensor last_error "\"name\":\"Last Error\",$st,\"value_template\":\"{{ value_json.error if value_json.error else 'none' }}\",$ex"
+	disc sensor dns "\"name\":\"DNS Check\",$st,\"value_template\":\"{{ value_json.dns }}\",$ex"
+	disc sensor last_check "\"name\":\"Last Check\",$st,\"device_class\":\"timestamp\",\"value_template\":\"{{ as_datetime(value_json.last_check | int) if value_json.last_check | int > 0 else None }}\",$ex"
+	disc binary_sensor kill_switch "\"name\":\"Kill Switch Active\",$st,\"value_template\":\"{{ 'ON' if value_json.kill_switch_active else 'OFF' }}\",$ex"
+	disc binary_sensor leak_risk "\"name\":\"Leak Risk\",\"device_class\":\"problem\",$st,\"value_template\":\"{{ 'ON' if value_json.leak_risk else 'OFF' }}\",$ex"
+	disc binary_sensor primary_ok "\"name\":\"Primary Exit Node OK\",\"device_class\":\"connectivity\",$st,\"value_template\":\"{{ 'ON' if value_json.primary_ok == 'ok' else 'OFF' }}\",$ex"
+	disc binary_sensor secondary_ok "\"name\":\"Secondary Exit Node OK\",\"device_class\":\"connectivity\",$st,\"value_template\":\"{{ 'ON' if value_json.secondary_ok == 'ok' else 'OFF' }}\",$ex"
+	disc binary_sensor error "\"name\":\"Error\",\"device_class\":\"problem\",$st,\"value_template\":\"{{ 'ON' if (value_json.error or value_json.state == 'ERROR') else 'OFF' }}\",$ex"
+}
+
+publish_state() {
+	pub "$MQTT_BASE/availability" online 1
+	j=$("$TSEM_BIN" status --json 2>/dev/null) || true # rc 1 only means leak_risk=true, still publish it
+	[ -n "$j" ] || return 1
+	pub "$MQTT_BASE/state" "$j" 1
+}
+
+handle() { # line = "<topic> <payload>"
+	topic=${1%% *}
+	payload=${1#* }
+	case $topic in
+	"$MQTT_BASE"/cmd/german)
+		case $payload in
+		ON) lg "command: german ON"; "$TSEM_BIN" set german --source ha --no-wait ;;
+		OFF) lg "command: german OFF"; "$TSEM_BIN" set direct --source ha --no-wait ;;
+		*) lg "ignored payload on german" ;;
+		esac
+		;;
+	"$MQTT_BASE"/cmd/auto_failover)
+		case $payload in
+		ON) "$TSEM_BIN" failover auto --source ha ;;
+		OFF) "$TSEM_BIN" failover off --source ha ;;
+		*) lg "ignored payload on auto_failover" ;;
+		esac
+		;;
+	"$MQTT_BASE"/cmd/failover_now)
+		case $payload in PRESS) "$TSEM_BIN" failover now ;; *) lg "ignored payload on failover_now" ;; esac
+		;;
+	*) lg "ignored topic" ;;
+	esac
+}
+
+load_conf
+make_opts
+trap 'rm -f "$OPTS"' EXIT
+trap 'exit 0' INT TERM
+lg "started (broker $MQTT_HOST:$MQTT_PORT, base $MQTT_BASE)"
+n=0
+while :; do
+	if [ $((n % 60)) -eq 0 ]; then publish_discovery || lg "discovery publish failed"; fi
+	publish_state || lg "state publish failed"
+	# Persistent session + QoS 1: commands sent between two waits are queued by the broker.
+	# -R: never process retained messages (no replay of old commands).
+	line=$("$SUB" -o "$OPTS" -i "tsem-$MQTT_ID" -c -q 1 -R -C 1 -W "$MQTT_INTERVAL" -v -t "$MQTT_BASE/cmd/#" 9>&- 2>/dev/null) || line=''
+	[ -z "$line" ] || { handle "$line"; publish_state; }
+	n=$((n + 1))
+	[ "${TSEM_MQTT_ONCE:-0}" != 1 ] || break
+	[ -n "$line" ] || sleep 1
+done

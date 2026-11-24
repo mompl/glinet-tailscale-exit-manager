@@ -1,0 +1,7 @@
+#!/bin/sh
+# WAN change / link flap: re-assert the kill switch and let the daemon re-evaluate.
+# Never blocks hotplug; never opens anything (reapply only enforces the CURRENT desired state).
+[ "$ACTION" = ifup ] || [ "$ACTION" = ifdown ] || exit 0
+[ -x /usr/sbin/tsem ] || exit 0
+( /usr/sbin/tsem reapply; /usr/sbin/tsem tick ) >/dev/null 2>&1 9>&- &
+exit 0

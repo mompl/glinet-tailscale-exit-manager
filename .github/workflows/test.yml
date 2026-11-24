@@ -1,0 +1,55 @@
+name: tsem-tests
+on:
+  push:
+    branches: ["feat/**", "fix/**", "main"]
+  pull_request:
+
+# Policy: every job below is MANDATORY. A missing dependency is a FAILURE (TSEM_STRICT=1), never a skip.
+# Missing tools are installed INSIDE the job (apk on the Alpine runner); the runner host is not modified by hand.
+env:
+  TSEM_STRICT: "1"
+  # The container runner has no CAP_NET_ADMIN/CAP_SYS_ADMIN: tests that need a real kernel netfilter are listed as NOT RUN here
+  # (never counted as passed) and are executed for real on the isolated VM ht-dev by tools/run-netns-vm.sh (docs/netns-vm.md).
+  TSEM_NO_KERNEL: "1"
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck and Lua (inside the job)
+        run: |
+          sh tools/ci-install.sh shellcheck lua5.4 || echo "::warning::apt could not provide shellcheck/lua5.4 (see the log above)"
+          command -v shellcheck >/dev/null || { echo "::error::shellcheck could not be provided inside the job"; exit 1; }
+          command -v lua5.4 >/dev/null || command -v lua5.3 >/dev/null || command -v lua >/dev/null || { echo "::error::no Lua interpreter could be provided inside the job"; exit 1; }
+          shellcheck --version | head -n 2
+      - name: ShellCheck (all shell sources, tests and tools)
+        run: |
+          files=$(git ls-files | while read -r f; do case $f in *.sh) echo "$f" ;; *) [ -f "$f" ] && head -c 40 "$f" | grep -q '^#!.*sh' && echo "$f" ;; esac; done)
+          echo "$files"
+          # -x follows includes; severity warning+error fails the job. Excluded, deliberately (not a way to hide findings):
+          #  SC2034 variables shared across sourced files/eval, SC2119/SC2120 optional arguments, SC2043 one-item loops,
+          #  SC2010 ls|grep on fixed ASCII names, SC2097/SC2098/SC1007 intentional env-prefix to a child, SC2209/SC2041 literal strings
+          echo "$files" | xargs shellcheck -x -S warning -e SC2034,SC2119,SC2120,SC2043,SC2010,SC2097,SC2098,SC1007,SC2209,SC2041
+      - name: Lua syntax check (native GUI bridge)
+        run: |
+          L=$(command -v luac5.4 || command -v luac5.3 || command -v luac || true)
+          [ -n "$L" ] || { echo "::error::luac missing"; exit 1; }
+          "$L" -p src/usr/lib/oui-httpd/rpc/tsem tests/lua/*.lua
+
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tooling for the API/GUI/Home Assistant/Lua tests (inside the job)
+        run: |
+          sh tools/ci-install.sh python3 nodejs curl dash bash lua5.4 tar || echo "::warning::apt could not provide everything (see the log above); checking what is there"
+          for t in python3 node curl dash tar; do command -v "$t" >/dev/null || { echo "::error::$t missing and not installable inside the job"; exit 1; }; done
+          command -v lua5.4 >/dev/null || command -v lua5.3 >/dev/null || command -v lua >/dev/null || { echo "::error::no Lua interpreter"; exit 1; }
+          tar --help 2>&1 | grep -c -- --sort >/dev/null || { command -v apk >/dev/null 2>&1 && apk add --no-cache tar; }; tar --help 2>&1 | grep -c -- --sort >/dev/null || { echo "::error::GNU tar (--sort) missing"; exit 1; }; python3 --version; node --version; curl --version | head -n 1
+      - name: Unit + installer tests (dash)
+        run: SH=dash sh tests/run.sh
+      - name: Unit + installer tests (bash)
+        run: SH=bash sh tests/run.sh
+      - name: Collector tests
+        run: sh tools/test-collect.sh

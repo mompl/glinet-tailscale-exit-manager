@@ -1,0 +1,27 @@
+#!/bin/sh
+# Test stub for uci: only what setup.sh/uninstall.sh use (toggle-button function and the old network rule).
+D=${UCI_STUB_DIR:?UCI_STUB_DIR not set}
+[ "$1" = -q ] && shift
+case $1 in
+get)
+	case $2 in
+	'switch-button.@main[0].func') [ -s "$D/func" ] || exit 1; cat "$D/func" ;;
+	'switch-button.@main[0]') [ -e "$D/main" ] || exit 1; echo main ;;
+	'tailscale.settings.exit_node_ip') [ -s "$D/glexit" ] || exit 1; cat "$D/glexit" ;;
+	*) exit 1 ;;
+	esac ;;
+set)
+	case $2 in
+	'switch-button.@main[0].func='*) echo "${2#*=}" >"$D/func" ;;
+	'tailscale.settings.exit_node_ip='*) echo "${2#*=}" >"$D/glexit" ;;
+	esac ;;
+delete)
+	case $2 in
+	'switch-button.@main[0].func') rm -f "$D/func" ;;
+	'tailscale.settings.exit_node_ip') rm -f "$D/glexit" ;;
+	network.ts_block_lan_leak)
+		awk '/^config rule .ts_block_lan_leak./ { skip = 1; next } skip && /^config / { skip = 0 } !skip { print }' "$UCI_NETFILE" >"$UCI_NETFILE.tmp" && mv "$UCI_NETFILE.tmp" "$UCI_NETFILE" ;;
+	esac ;;
+commit) echo "$2" >>"$D/commits" ;;
+esac
+exit 0

@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TSEM interface demo</title>
+<style>
+:root{--bg:#f3f4f6;--ink:#1f2430;--mut:#6b7280;--bar:#ffffff;--line:#e5e7eb}
+@media (prefers-color-scheme:dark){:root{--bg:#161b26;--ink:#e5e7eb;--mut:#9ca3af;--bar:#1f2430;--line:#343b4d}}
+html,body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.bar{position:sticky;top:0;z-index:5;display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 12px;background:var(--bar);border-bottom:1px solid var(--line)}
+.bar b{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mut)}
+.bar button{font:inherit;font-size:13px;padding:5px 11px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);cursor:pointer}
+.bar button:hover{border-color:#2563eb}
+.bar .sp{flex:1}
+.bar small{color:var(--mut)}
+#app{padding:10px 12px 28px}
+</style>
+</head>
+<body>
+<div class="bar" id="bar">
+  <b id="t-demo">Demo controls</b>
+  <button type="button" data-s="fail1" id="b1">Primary fails</button>
+  <button type="button" data-s="fail2" id="b2">Both fail</button>
+  <button type="button" data-s="recover" id="b3">Recover</button>
+  <span class="sp"></span>
+  <small id="t-note">The real TSEM interface file, answered by recorded replies of the real controller. Not a live router.</small>
+</div>
+<div id="app"></div>
+<script src="mini-vue.js"></script>
+<script>
+(function () {
+  var q = new URLSearchParams(location.search), lang = q.get('lang') === 'de' ? 'de' : 'en';
+  document.documentElement.lang = lang;
+  var TXT = { en: ['Demo controls', 'Primary fails', 'Both fail', 'Recover', 'The real TSEM interface file, answered by recorded replies of the real controller. Not a live router.'],
+              de: ['Demo-Steuerung', 'Primary fällt aus', 'Beide fallen aus', 'Wiederherstellen', 'Die echte TSEM-Oberfläche, beantwortet mit aufgezeichneten Antworten des echten Controllers. Kein echter Router.'] }[lang];
+  ['t-demo', 'b1', 'b2', 'b3', 't-note'].forEach(function (id, i) { document.getElementById(id).textContent = TXT[i]; });
+  if (q.get('bar') === '0') document.getElementById('bar').style.display = 'none';
+  document.cookie = 'Admin-Token=demo-session; path=/';
+
+  Promise.all([fetch('gui-fixtures.json').then(function (r) { return r.json(); }), fetch('gui-bundle.js').then(function (r) { return r.text(); })]).then(function (res) {
+    var fx = res[0], by = {}; fx.states.forEach(function (s) { by[s.name] = s.state; });
+    var cur = q.get('state') || 'exit', timer = null;
+    function S() { return by[cur]; }
+    function ST() { return S().status.status; } // the status object inside the plugin's reply
+    function setState(n) { cur = n; }
+    function reply(m, p) {
+      var s = S();
+      switch (m) {
+        case 'status': return s.status;
+        case 'nodes': return s.nodes;
+        case 'config_get': return s.config_get;
+        case 'events': return s.events;
+        case 'diag': return s.diag;
+        case 'subnets': return s.subnets;
+        case 'egress': return s.egress;
+        case 'set_mode':
+          clearTimeout(timer);
+          if (p && p.mode === 'direct') { setState('direct'); return Object.assign({}, fx.actions.set_mode_direct, { status: ST(), message: 'tsem: set direct requested by source=gui changed=1 apply_rc=0 wait=0' }); }
+          setState('connecting'); timer = setTimeout(function () { setState('exit'); }, 8000);
+          return Object.assign({}, fx.actions.set_mode_german, { status: ST(), message: 'tsem: set german requested by source=gui changed=1 apply_rc=0 wait=0' });
+        case 'failover_now': clearTimeout(timer); setState('failover'); return { ok: true, status: ST() };
+        default: return { ok: true, status: ST(), config: (s.config_get || {}).config };
+      }
+    }
+    window.fetch = function (url, opts) {
+      var body = JSON.parse(opts.body), call = body.params[3];
+      var result = reply(call.m, call.p);
+      return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve({ jsonrpc: '2.0', id: body.id, result: result }); } });
+    };
+    var comp = (0, eval)(res[1]);
+    MiniVue.mount(comp, document.getElementById('app'));
+    document.getElementById('bar').addEventListener('click', function (e) {
+      var s = e.target.getAttribute && e.target.getAttribute('data-s'); if (!s) return;
+      clearTimeout(timer);
+      setState({ fail1: 'failover', fail2: 'blocked', recover: 'recovered' }[s]);
+    });
+  }).catch(function (e) { document.getElementById('app').textContent = 'Demo could not start: ' + e.message; });
+})();
+</script>
+</body>
+</html>

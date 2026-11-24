@@ -1,0 +1,13 @@
+#!/bin/sh
+# Network (re)connect: check the tailscale0 NAT state shortly afterwards. Event-driven, debounced (one run per 5 s),
+# never blocks hotplug, never reloads the firewall, writes nothing when the state is already right.
+[ "$ACTION" = ifup ] || [ "$ACTION" = ifupdate ] || exit 0
+[ -x /usr/sbin/tsem-masq ] || exit 0
+_d=/var/run/tsem-masq
+mkdir -p "$_d" 2>/dev/null
+_now=$(date +%s)
+_last=$(cat "$_d/hotplug" 2>/dev/null || echo 0)
+[ $((_now - _last)) -ge 5 ] || exit 0
+echo "$_now" >"$_d/hotplug"
+( sleep 3; TSEM_MASQ_NORELOAD=1 /usr/sbin/tsem-masq ensure ) >/dev/null 2>&1 9>&- &
+exit 0

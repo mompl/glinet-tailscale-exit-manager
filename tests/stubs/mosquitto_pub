@@ -1,0 +1,16 @@
+#!/bin/sh
+# Test stub: records "<options-file-content-hash?>|args" and the payload.
+D=${MQ_STUB_DIR:?}
+topic='' payload='' retain=0 opts=''
+while [ $# -gt 0 ]; do
+	case $1 in
+	-t) topic=$2; shift 2 ;;
+	-m) payload=$2; shift 2 ;;
+	-r) retain=1; shift ;;
+	-o) opts=$2; shift 2 ;;
+	-q) shift 2 ;;
+	*) shift ;;
+	esac
+done
+printf '%s\t%s\t%s\n' "$retain" "$topic" "$payload" >>"$D/published"
+[ -z "$opts" ] || cp "$opts" "$D/opts.seen" 2>/dev/null

@@ -1,0 +1,25 @@
+#!/bin/sh /etc/rc.common
+# tsem-masq: keeps masquerading of the GL.iNet zone "tailscale0" in place (see /usr/sbin/tsem-masq).
+# Independent of the tsem kill switch service: works with tsem stopped, disabled or not installed.
+# START=96 runs after firewall (19), network (20) and the GL.iNet Tailscale service.
+
+START=96
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	# one reconciliation at boot (no firewall reload from here), then a low-frequency watcher
+	TSEM_MASQ_NORELOAD=1 /usr/sbin/tsem-masq ensure 2>&1 | logger -t tsem-masq
+	procd_open_instance
+	procd_set_param command /usr/sbin/tsem-masq watch
+	procd_set_param env TSEM_MASQ_NORELOAD=1
+	procd_set_param respawn 3600 30 0
+	procd_set_param stdout 0
+	procd_set_param stderr 0
+	procd_close_instance
+}
+
+service_triggers() {
+	# the firewall config was changed through ubus/uci: reconcile immediately (idempotent, no loop)
+	procd_add_config_trigger "config.change" "firewall" /usr/sbin/tsem-masq ensure --no-reload
+}

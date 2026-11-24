@@ -1,0 +1,15 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "GL.iNet Tailscale Exit Manager",
+        "description": "Router address and a router user that has the rpcd ACL \"tsem-write\" (read-only users can only monitor).",
+        "data": { "host": "Router address", "username": "Username", "password": "Password", "port": "Port", "ssl": "Use HTTPS" }
+      },
+      "reauth_confirm": { "title": "Re-authenticate", "data": { "password": "Password" } }
+    },
+    "error": { "cannot_connect": "The router or the TSEM API cannot be reached.", "invalid_auth": "Login failed.", "unknown": "Unexpected error." },
+    "abort": { "already_configured": "This router is already configured.", "reauth_successful": "Re-authentication successful." }
+  },
+  "options": { "step": { "init": { "data": { "scan_interval": "Update interval (seconds)" } } } }
+}

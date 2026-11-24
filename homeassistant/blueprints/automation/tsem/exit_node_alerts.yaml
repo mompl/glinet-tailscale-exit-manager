@@ -1,0 +1,268 @@
+blueprint:
+  name: TSEM - exit node alerts with one-tap actions
+  description: >
+    Push notifications (Home Assistant Companion app, iPhone and Android) for the Tailscale Exit Manager:
+    exit node failed (failover), BLOCKED (no usable exit node, the LAN is cut on purpose), primary exit node back,
+    router not reachable from Home Assistant, leak risk, and a mode change made by the hardware switch, the GUI or the
+    command line. Alerts carry buttons ("Go DIRECT", "Back to exit node", "Keep blocked"); after a tap you get a
+    confirmation that says what the router REALLY reached, not just what was requested.
+    Alerts that mean "the Internet is cut or the protection is incomplete" (BLOCKED, exit node unstable, leak risk, router not
+    reachable) are always sent as CRITICAL alerts (iPhone: allow "Critical alerts" for the Companion app; Android: alarm channel).
+    The failover to the backup node and mode changes use the interruption level you choose below.
+    Create one automation per router. Needs the TSEM integration (custom_components/tsem).
+  domain: automation
+  input:
+    notify_service:
+      name: Notify service
+      description: The notify service of your phone, for example notify.mobile_app_my_iphone. Add several phones by creating one automation each.
+      selector:
+        text:
+    state_sensor:
+      name: Controller state sensor
+      selector:
+        entity:
+          integration: tsem
+          domain: sensor
+    connection:
+      name: Controller connection
+      selector:
+        entity:
+          integration: tsem
+          domain: binary_sensor
+    leak_risk:
+      name: Leak risk
+      selector:
+        entity:
+          integration: tsem
+          domain: binary_sensor
+    mode_switch:
+      name: Exit node mode switch
+      description: The switch that turns the protected exit-node mode on and off.
+      selector:
+        entity:
+          integration: tsem
+          domain: switch
+    down_delay:
+      name: Router unreachable for
+      description: Only alert when Home Assistant has not reached the router for this long.
+      default: {minutes: 2}
+      selector:
+        duration:
+    urgency:
+      name: iPhone interruption level
+      description: "time-sensitive breaks through Focus modes; critical also plays a sound when the phone is silent (needs the critical-alert permission in the app). Android uses high priority for both."
+      default: time-sensitive
+      selector:
+        select:
+          options: [passive, active, time-sensitive, critical]
+    allow_direct_button:
+      name: Offer a "Go DIRECT" button
+      description: DIRECT turns the kill switch off, traffic then leaves WITHOUT the exit node. Switch it off if you never want a one-tap path to that.
+      default: true
+      selector:
+        boolean:
+
+mode: queued
+max: 10
+
+variables:
+  notify_service: !input notify_service
+  state_sensor: !input state_sensor
+  mode_switch: !input mode_switch
+  urgency: !input urgency
+  allow_direct: !input allow_direct_button
+
+trigger:
+  - platform: state
+    entity_id: !input state_sensor
+    to: SECONDARY_ACTIVE
+    id: failover
+  - platform: state
+    entity_id: !input state_sensor
+    to: DEGRADED
+    id: degraded
+  - platform: state
+    entity_id: !input state_sensor
+    to: BLOCKED
+    id: blocked
+  - platform: state
+    entity_id: !input state_sensor
+    to: PRIMARY_ACTIVE
+    from: [SECONDARY_ACTIVE, DEGRADED, BLOCKED, CONNECTING_PRIMARY, CONNECTING_SECONDARY]
+    id: recovered
+  - platform: state
+    entity_id: !input connection
+    to: "off"
+    for: !input down_delay
+    id: unreachable
+  - platform: state
+    entity_id: !input leak_risk
+    to: "on"
+    id: leak
+  - platform: state
+    entity_id: !input mode_switch
+    to: ["on", "off"]
+    from: ["on", "off"]
+    id: mode_changed
+  - platform: event
+    event_type: mobile_app_notification_action
+    event_data:
+      action: TSEM_GO_DIRECT
+    id: act_direct
+  - platform: event
+    event_type: mobile_app_notification_action
+    event_data:
+      action: TSEM_GO_EXIT
+    id: act_exit
+  - platform: event
+    event_type: mobile_app_notification_action
+    event_data:
+      action: TSEM_KEEP
+    id: act_keep
+
+action:
+  - choose:
+      - alias: Failover to the secondary exit node
+        conditions: "{{ trigger.id == 'failover' }}"
+        sequence:
+          - service: !input notify_service
+            data:
+              title: "Exit node failed - using the backup"
+              message: >-
+                The primary exit node does not answer. Traffic now goes through the secondary exit node.
+                The kill switch is still on, nothing leaks.
+              data: &data_base
+                tag: tsem_status
+                group: tsem
+                channel: tsem
+                importance: high
+                ttl: 0
+                priority: high
+                push:
+                  interruption-level: "{{ urgency }}"
+      - alias: Exit node degraded
+        conditions: "{{ trigger.id == 'degraded' }}"
+        sequence:
+          - service: !input notify_service
+            data:
+              title: "Exit node unstable"
+              message: "The current exit node fails its checks. The kill switch holds traffic back until it answers again or the backup takes over."
+              data: &data_critical
+                tag: tsem_status
+                group: tsem
+                channel: alarm_stream
+                importance: high
+                ttl: 0
+                priority: high
+                push:
+                  interruption-level: critical
+                  sound:
+                    name: default
+                    critical: 1
+                    volume: 1.0
+      - alias: BLOCKED - no usable exit node
+        conditions: "{{ trigger.id == 'blocked' }}"
+        sequence:
+          - service: !input notify_service
+            data:
+              title: "BLOCKED - no exit node reachable"
+              message: >-
+                Neither exit node works. The router blocks Internet access for the whole LAN on purpose, nothing leaves unprotected.
+                You can wait, or decide below.
+              data:
+                <<: *data_critical
+                actions: >-
+                  {{ ([{'action': 'TSEM_KEEP', 'title': 'Keep blocked'}] +
+                      ([{'action': 'TSEM_GO_DIRECT', 'title': 'Go DIRECT (unprotected)', 'destructive': true}] if allow_direct else [])) }}
+      - alias: Primary exit node is back
+        conditions: "{{ trigger.id == 'recovered' }}"
+        sequence:
+          - service: !input notify_service
+            data:
+              title: "Exit node is back"
+              message: "Traffic goes through the primary exit node again."
+              data:
+                tag: tsem_status
+                group: tsem
+                channel: tsem
+      - alias: Router not reachable from Home Assistant
+        conditions: "{{ trigger.id == 'unreachable' }}"
+        sequence:
+          - service: !input notify_service
+            data:
+              title: "Router not reachable"
+              message: "Home Assistant cannot reach the router. If the router itself is up, the exit node is not the problem, check the router or the link to it."
+              data: *data_critical
+      - alias: Leak risk
+        conditions: "{{ trigger.id == 'leak' }}"
+        sequence:
+          - service: !input notify_service
+            data:
+              title: "LEAK RISK on the router"
+              message: "The protection is not completely installed. Open the router GUI, Diagnostics, or run 'tsem diag'."
+              data: *data_critical
+      - alias: Mode changed (hardware switch, GUI or command line)
+        conditions: "{{ trigger.id == 'mode_changed' and state_attr(state_sensor, 'last_change_source') != 'ha' }}"
+        sequence:
+          - service: !input notify_service
+            data:
+              title: "Mode changed: {{ 'Exit node' if trigger.to_state.state == 'on' else 'DIRECT' }}"
+              message: >-
+                Requested by {{ state_attr(state_sensor, 'last_change_source') or 'unknown' }}.
+                {{ 'Traffic goes through the exit node (kill switch on).' if trigger.to_state.state == 'on' else 'Kill switch OFF: traffic leaves directly.' }}
+              data:
+                tag: tsem_mode
+                group: tsem
+                channel: tsem
+                actions: >-
+                  {{ [{'action': 'TSEM_GO_EXIT', 'title': 'Back to exit node'}] if trigger.to_state.state == 'off' else
+                     ([{'action': 'TSEM_GO_DIRECT', 'title': 'Go DIRECT', 'destructive': true}] if allow_direct else []) }}
+      - alias: Button - go DIRECT
+        conditions: "{{ trigger.id == 'act_direct' and allow_direct }}"
+        sequence:
+          - service: switch.turn_off
+            target:
+              entity_id: !input mode_switch
+          - wait_template: "{{ is_state(state_sensor, 'DISABLED') }}"
+            timeout: {seconds: 60}
+            continue_on_timeout: true
+          - service: !input notify_service
+            data:
+              title: "{{ 'DIRECT is active' if is_state(state_sensor, 'DISABLED') else 'DIRECT NOT confirmed' }}"
+              message: >-
+                {{ 'Kill switch OFF: traffic leaves directly, without the exit node.' if is_state(state_sensor, 'DISABLED')
+                   else 'You asked for DIRECT, but the router reports ' ~ states(state_sensor) ~ '. Check the router.' }}
+              data:
+                tag: tsem_mode
+                group: tsem
+                channel: tsem
+                actions:
+                  - action: TSEM_GO_EXIT
+                    title: Back to exit node
+      - alias: Button - back to the exit node
+        conditions: "{{ trigger.id == 'act_exit' }}"
+        sequence:
+          - service: switch.turn_on
+            target:
+              entity_id: !input mode_switch
+          - wait_template: "{{ states(state_sensor) in ['PRIMARY_ACTIVE', 'SECONDARY_ACTIVE'] }}"
+            timeout: {seconds: 90}
+            continue_on_timeout: true
+          - service: !input notify_service
+            data:
+              title: "{{ 'Exit node mode is active' if states(state_sensor) in ['PRIMARY_ACTIVE', 'SECONDARY_ACTIVE'] else 'Exit node mode NOT reached yet' }}"
+              message: >-
+                {{ 'Traffic goes through the exit node.' if states(state_sensor) in ['PRIMARY_ACTIVE', 'SECONDARY_ACTIVE']
+                   else 'The router reports ' ~ states(state_sensor) ~ '. The kill switch keeps traffic from leaking meanwhile.' }}
+              data:
+                tag: tsem_mode
+                group: tsem
+                channel: tsem
+      - alias: Button - keep blocked
+        conditions: "{{ trigger.id == 'act_keep' }}"
+        sequence:
+          - service: !input notify_service
+            data:
+              message: clear_notification
+              data:
+                tag: tsem_status

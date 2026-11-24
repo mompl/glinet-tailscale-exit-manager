@@ -1,0 +1,10 @@
+#!/bin/sh
+# Test stub: records its arguments; prints one queued "<topic> <payload>" line if available.
+D=${MQ_STUB_DIR:?}
+echo "$*" >>"$D/sub_args"
+if [ -s "$D/sub_queue" ]; then
+	head -n 1 "$D/sub_queue"
+	tail -n +2 "$D/sub_queue" >"$D/sub_queue.tmp"; mv "$D/sub_queue.tmp" "$D/sub_queue"
+	exit 0
+fi
+exit 27

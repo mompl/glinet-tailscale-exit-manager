@@ -1,0 +1,74 @@
+-- TSEM: RPC object "tsem" for the native GL.iNet web UI (oui-httpd). Installed by the "native-gui" component only.
+--
+-- This file is a thin bridge and contains no business logic: it forwards a WHITELISTED method with strictly
+-- validated parameters to the one local API plugin (/usr/libexec/rpcd/tsem), which calls the one controller.
+-- Authentication is whatever oui-httpd enforces for every RPC object (GL.iNet admin session); this file never
+-- reads a session itself and never opens a port. The caller cannot choose the "source" (always "gui") and DIRECT
+-- needs the boolean true in "confirm". Anything not listed below is refused.
+--
+-- UNVERIFIED on real firmware (no Lua interpreter or GL.iNet firmware in the test environment): the module shape
+-- (a table of functions that receive one parameter table and return a table) follows public community packages.
+-- docs/native-gui.md lists exactly what the read-only preflight and the acceptance still have to confirm.
+
+local cjson = require "cjson"
+
+local M = {}
+
+local PLUGIN = "/usr/libexec/rpcd/tsem"
+local MAXLEN = 64
+-- the list of released networks (up to 8 CIDRs, the controller checks every one) is longer than a name
+local LIMIT = { allow_subnets4 = 200 }
+
+-- method -> allowed parameter names and their types
+local SPEC = {
+	status = {}, config_get = {}, nodes = {}, subnets = {}, egress = {}, events = {}, diag = {}, failover_now = {},
+	set_mode = { mode = "string", confirm = "boolean" },
+	set_failover = { mode = "string" },
+	config_set = { primary = "string", primary_name = "string", secondary = "string", secondary_name = "string", auto_return = "boolean", mode_label = "string", allow_subnets4 = "string", hw_at_boot = "string" },
+}
+
+local function fail(code, msg)
+	return { ok = false, code = code, error = msg }
+end
+
+local function clean(method, p)
+	local spec = SPEC[method]
+	local out = {}
+	if type(p) ~= "table" then p = {} end
+	for k, v in pairs(p) do
+		local want = spec[k]
+		if k ~= "source" then
+			if not want then return nil, "unknown parameter: " .. tostring(k) end
+			if type(v) ~= want then return nil, "parameter " .. k .. " must be a " .. want end
+			if want == "string" and (#v > (LIMIT[k] or MAXLEN) or v:find("[%c]")) then return nil, "parameter " .. k .. " is invalid" end
+			out[k] = v
+		end
+	end
+	if method == "set_mode" or method == "set_failover" then out.source = "gui" end
+	return out
+end
+
+function M.call(args)
+	if type(args) ~= "table" or type(args.m) ~= "string" or not SPEC[args.m] then
+		return fail("not_found", "unknown method")
+	end
+	local p, err = clean(args.m, args.p)
+	if not p then return fail("invalid_argument", err) end
+
+	local tmp = os.tmpname()
+	local f = io.open(tmp, "w")
+	if not f then return fail("backend", "cannot create a temporary file") end
+	f:write(cjson.encode(p))
+	f:close()
+	-- args.m is a key of SPEC (a fixed set of plain words) and tmp comes from os.tmpname(): nothing user-controlled is quoted
+	local h = io.popen("PATH=\"${PATH:+$PATH:}/usr/sbin:/usr/bin:/sbin:/bin\" sh " .. PLUGIN .. " call " .. args.m .. " <" .. tmp .. " 2>/dev/null")
+	local out = h and h:read("*a") or ""
+	if h then h:close() end
+	os.remove(tmp)
+
+	local ok, res = pcall(cjson.decode, out)
+	if not ok or type(res) ~= "table" then return fail("backend", "the controller API did not answer") end
+	return res
+end
+
+return M

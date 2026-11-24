@@ -1,0 +1,14 @@
+#!/bin/sh /etc/rc.common
+# tsem-restore: puts TSEM back after a firmware upgrade.
+# A sysupgrade replaces everything outside the files listed in /etc/sysupgrade.conf. The installer keeps /etc/tsem/
+# (configuration, intent and a copy of the install package in /etc/tsem/pkg) and THIS script across upgrades.
+# START=17 runs before tsem (18), firewall (19) and network (20), so the kill switch is back before LAN traffic flows.
+# It does nothing while TSEM is installed.
+
+START=17
+
+start() {
+	[ -x /usr/sbin/tsem ] && [ -f /usr/lib/tsem/common.sh ] && return 0
+	[ -f /etc/tsem/pkg/restore.sh ] || return 0
+	sh /etc/tsem/pkg/restore.sh
+}

@@ -1,0 +1,23 @@
+{
+	"tsem-read": {
+		"description": "TSEM: read controller state",
+		"read": {
+			"ubus": {
+				"tsem": ["status", "config_get", "nodes", "subnets", "egress", "events", "diag"]
+			}
+		}
+	},
+	"tsem-write": {
+		"description": "TSEM: change mode, failover and exit-node configuration",
+		"read": {
+			"ubus": {
+				"tsem": ["status", "config_get", "nodes", "subnets", "egress", "events", "diag"]
+			}
+		},
+		"write": {
+			"ubus": {
+				"tsem": ["set_mode", "set_failover", "failover_now", "config_set"]
+			}
+		}
+	}
+}

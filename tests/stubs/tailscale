@@ -1,0 +1,47 @@
+#!/bin/sh
+# Test stub for the tailscale CLI. Simulates what tailscaled does to routing:
+# selecting an exit node installs "default dev tailscale0" in table 52.
+D=${TS_STUB_DIR:?TS_STUB_DIR not set}
+[ ! -e "$D/calls" ] || true
+echo "$*" >>"$D/calls"
+case $1 in
+set)
+	[ ! -e "$D/ts_dead" ] || { echo "failed to connect to local tailscaled" >&2; exit 1; }
+	[ ! -e "$D/set_fail" ] || { echo "stub: set refused" >&2; exit 1; }
+	v=${2#--exit-node=}
+	if [ -z "$v" ]; then
+		rm -f "$D/exit"
+		ip route del default table 52 2>/dev/null
+		ip route del 10.20.0.0/24 table 52 2>/dev/null
+	else
+		echo "$v" >"$D/exit"
+		ip route replace default dev tailscale0 table 52
+		# like --exit-node-allow-lan-access / throw routes: replies to LAN clients must not loop back
+		ip route replace 10.20.0.0/24 dev br-lan table 52
+	fi
+	;;
+status)
+	[ ! -e "$D/ts_dead" ] || exit 1
+	echo '{"Version":"1.92.5","BackendState":"Running",'
+	if [ -f "$D/exit" ]; then
+		printf '"ExitNodeStatus": {\n  "ID": "nStub",\n  "Online": true,\n  "TailscaleIPs": [\n    "%s/32"\n  ]\n},\n' "$(cat "$D/exit")"
+	fi
+	echo '"Self":{"Online":true}}'
+	;;
+debug)
+	[ ! -e "$D/ts_dead" ] || exit 1
+	e=$(cat "$D/exit" 2>/dev/null)
+	printf '{\n "ExitNodeID": "%s",\n "ExitNodeIP": "",\n "AdvertiseRoutes": null\n}\n' "${e:+nStub}"
+	;;
+ping)
+	# mirrors the real CLI: it prints the pong line and exits 1 when no DIRECT path exists (DERP only)
+	for last; do :; done
+	[ ! -e "$D/ts_dead" ] || { echo "failed to connect to local tailscaled" >&2; exit 1; }
+	if [ -e "$D/ping_all_down" ] || [ -e "$D/ping_down_$last" ]; then echo "ping \"$last\" timed out"; exit 1; fi
+	if [ -e "$D/ping_derp_only" ] || [ -e "$D/ping_derp_$last" ]; then
+		echo "pong from stub-node ($last) via DERP(nue) in 224ms"; exit 1
+	fi
+	echo "pong from stub-node ($last) via 203.0.113.9:41641 in 31ms"; exit 0
+	;;
+*) exit 2 ;;
+esac

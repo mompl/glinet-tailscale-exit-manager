@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TSEM · Tailscale Exit Manager</title>
+<meta name="description" content="Fail-closed Tailscale exit node manager for GL.iNet and OpenWrt routers: your LAN goes out through the exit node you chose, directly, or nowhere.">
+<meta name="theme-color" content="#0a1020">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230a1020'/%3E%3Cpath d='M32 10l18 7v15c0 11-8 19-18 23-10-4-18-12-18-23V17z' fill='none' stroke='%237dd3fc' stroke-width='4'/%3E%3Cpath d='M23 32l7 7 12-14' fill='none' stroke='%2334d399' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<style>
+:root{
+  --bg:#f6f8fc; --bg2:#ffffff; --ink:#0f172a; --muted:#475569; --line:#dbe3ef;
+  --card:#ffffff; --accent:#0284c7; --good:#059669; --bad:#dc2626; --warn:#b45309;
+  --code:#0f172a; --codeink:#e2e8f0; --glow:rgba(2,132,199,.18);
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --bg:#0a1020; --bg2:#0f1830; --ink:#e8eefc; --muted:#9fb0cc; --line:#1f2d4d;
+    --card:#111c38; --accent:#7dd3fc; --good:#34d399; --bad:#f87171; --warn:#fbbf24;
+    --code:#060b17; --codeink:#dbe7ff; --glow:rgba(56,189,248,.22);
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0a1020; --bg2:#0f1830; --ink:#e8eefc; --muted:#9fb0cc; --line:#1f2d4d;
+  --card:#111c38; --accent:#7dd3fc; --good:#34d399; --bad:#f87171; --warn:#fbbf24;
+  --code:#060b17; --codeink:#dbe7ff; --glow:rgba(56,189,248,.22);
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.65 system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+.wrap{max-width:1080px;margin:0 auto;padding:0 20px}
+code,pre,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+
+/* backdrop */
+.backdrop{position:fixed;inset:0;z-index:-1;overflow:hidden;pointer-events:none}
+.backdrop i{position:absolute;border-radius:50%;filter:blur(90px);opacity:.55;animation:float 22s ease-in-out infinite}
+.backdrop i:nth-child(1){width:420px;height:420px;left:-80px;top:-60px;background:var(--glow)}
+.backdrop i:nth-child(2){width:520px;height:520px;right:-140px;top:30%;background:rgba(52,211,153,.14);animation-delay:-7s}
+.backdrop i:nth-child(3){width:380px;height:380px;left:30%;bottom:-120px;background:rgba(129,140,248,.14);animation-delay:-13s}
+@keyframes float{0%,100%{transform:translate(0,0)}50%{transform:translate(40px,-30px)}}
+
+/* nav */
+nav{position:sticky;top:0;z-index:10;backdrop-filter:blur(12px);background:color-mix(in srgb,var(--bg) 78%,transparent);border-bottom:1px solid var(--line)}
+nav .wrap{display:flex;align-items:center;gap:14px;height:60px}
+.brand{font-weight:800;letter-spacing:.5px;color:var(--ink);display:flex;align-items:center;gap:10px}
+.brand svg{width:26px;height:26px}
+nav .sp{flex:1}
+nav a.l{color:var(--muted);font-size:14px}
+nav a.l:hover{color:var(--ink);text-decoration:none}
+.pill{border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:999px;padding:6px 12px;font-size:13px;cursor:pointer}
+.pill:hover{border-color:var(--accent)}
+@media(max-width:720px){nav a.l{display:none}}
+
+/* hero */
+.hero{padding:64px 0 24px;text-align:center}
+.eyebrow{display:inline-block;font-size:13px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);border:1px solid var(--line);background:var(--card);padding:6px 14px;border-radius:999px}
+h1{font-size:clamp(34px,6vw,64px);line-height:1.08;margin:22px 0 16px;letter-spacing:-.02em}
+h1 .g{background:linear-gradient(90deg,#38bdf8,#34d399,#818cf8,#38bdf8);background-size:300% 100%;-webkit-background-clip:text;background-clip:text;color:transparent;animation:shine 8s linear infinite}
+@keyframes shine{to{background-position:300% 0}}
+.lead{max-width:720px;margin:0 auto 28px;color:var(--muted);font-size:clamp(16px,2.2vw,20px)}
+.cta{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-bottom:34px}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:12px 22px;border-radius:12px;font-weight:700;border:1px solid var(--line);background:var(--card);color:var(--ink);cursor:pointer;font-size:15px;transition:transform .15s,box-shadow .15s}
+.btn:hover{transform:translateY(-2px);box-shadow:0 10px 30px var(--glow);text-decoration:none}
+.btn.primary{background:linear-gradient(90deg,#0ea5e9,#10b981);color:#fff;border-color:transparent}
+.heroimg{max-width:960px;margin:0 auto;border-radius:22px;overflow:hidden;box-shadow:0 30px 80px rgba(2,12,40,.35);border:1px solid var(--line)}
+.heroimg img{display:block;width:100%;height:auto}
+
+.winframe{max-width:1000px;margin:34px auto 0;border-radius:16px;overflow:hidden;border:1px solid var(--line);background:var(--card);box-shadow:0 30px 80px rgba(2,12,40,.35);text-align:left}
+.winbar{display:flex;align-items:center;gap:7px;padding:10px 14px;background:var(--bg2);border-bottom:1px solid var(--line);font-size:13px;color:var(--muted)}
+.winbar i{width:11px;height:11px;border-radius:50%;background:#64748b;opacity:.5}
+.winbar i:nth-child(1){background:#f87171}.winbar i:nth-child(2){background:#fbbf24}.winbar i:nth-child(3){background:#34d399}
+.winbar span{margin-left:10px}
+.winframe iframe{display:block;width:100%;height:min(80vh,820px);min-height:520px;border:0;background:transparent}
+.framenote{margin:0;padding:10px 16px;border-top:1px solid var(--line);font-size:13px;color:var(--muted)}
+/* sections */
+section{padding:72px 0}
+h2{font-size:clamp(26px,4vw,40px);letter-spacing:-.01em;margin:0 0 10px;text-align:center}
+.sub{max-width:680px;margin:0 auto 38px;text-align:center;color:var(--muted)}
+.grid{display:grid;gap:16px}
+.g3{grid-template-columns:repeat(3,1fr)}
+.g2{grid-template-columns:repeat(2,1fr)}
+@media(max-width:860px){.g3{grid-template-columns:1fr}.g2{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px;transition:transform .2s,border-color .2s,box-shadow .2s}
+.card:hover{transform:translateY(-4px);border-color:var(--accent);box-shadow:0 14px 40px var(--glow)}
+.card h3{margin:10px 0 6px;font-size:19px}
+.card p{margin:0;color:var(--muted);font-size:15px}
+.ico{width:44px;height:44px;border-radius:12px;display:grid;place-items:center;font-size:22px;background:var(--bg2);border:1px solid var(--line)}
+
+/* modes demo */
+.demo{background:var(--card);border:1px solid var(--line);border-radius:22px;padding:22px}
+.tabs{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-bottom:18px}
+.tab{border:1px solid var(--line);background:var(--bg2);color:var(--ink);border-radius:12px;padding:10px 18px;font-weight:700;cursor:pointer;font-size:14px}
+.tab[aria-selected="true"]{color:#fff;border-color:transparent}
+.tab[data-m="direct"][aria-selected="true"]{background:#0284c7}
+.tab[data-m="exit"][aria-selected="true"]{background:#059669}
+.tab[data-m="blocked"][aria-selected="true"]{background:#dc2626}
+.stage{display:flex;align-items:center;gap:6px;max-width:760px;margin:0 auto;padding:18px 0}
+.node{flex:none;width:104px;text-align:center;font-size:13px;color:var(--muted)}
+.node b{display:block;color:var(--ink);font-size:14px}
+.node .bx{height:64px;border-radius:14px;border:1px solid var(--line);background:var(--bg2);display:grid;place-items:center;font-size:28px;margin-bottom:6px;transition:border-color .3s,box-shadow .3s}
+.lw{flex:1;position:relative;min-width:16px;display:flex;align-items:center;margin-bottom:26px}
+.line{position:relative;width:100%;height:3px;background:var(--line);border-radius:3px;overflow:hidden}
+@media(max-width:520px){.node{width:76px;font-size:12px}.node .bx{height:52px;font-size:22px}.node b{font-size:12px}}
+.pk{position:absolute;top:-2px;width:14px;height:7px;border-radius:7px;background:var(--accent);left:-14px;opacity:0}
+.stage[data-m="direct"] .pk,.stage[data-m="exit"] .pk{opacity:1;animation:run 1.6s linear infinite}
+.stage .pk:nth-child(2){animation-delay:.8s!important}
+.stage[data-m="exit"] .pk{background:var(--good)}
+.stage[data-m="blocked"] .lw2 .line{background:repeating-linear-gradient(90deg,var(--bad) 0 8px,transparent 8px 16px);opacity:.55}
+.stage[data-m="blocked"] .n2 .bx{border-color:var(--bad);box-shadow:0 0 0 6px color-mix(in srgb,var(--bad) 18%,transparent)}
+.stage[data-m="exit"] .n2 .bx{border-color:var(--good);box-shadow:0 0 0 6px color-mix(in srgb,var(--good) 18%,transparent)}
+.stage[data-m="direct"] .n2 .bx{border-color:var(--accent);box-shadow:0 0 0 6px color-mix(in srgb,var(--accent) 18%,transparent)}
+@keyframes run{from{left:-14px}to{left:100%}}
+.cap{text-align:center;margin:14px auto 0;max-width:640px;color:var(--muted);min-height:3.3em}
+.cap b{color:var(--ink)}
+.x{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:2;color:var(--bad);font-weight:900;font-size:30px;opacity:0;transition:opacity .3s}
+.stage[data-m="blocked"] .x{opacity:1}
+
+/* flow */
+.steps{counter-reset:s;display:grid;gap:14px;max-width:760px;margin:0 auto}
+.step{position:relative;padding:18px 20px 18px 66px;background:var(--card);border:1px solid var(--line);border-radius:16px}
+.step::before{counter-increment:s;content:counter(s);position:absolute;left:18px;top:16px;width:32px;height:32px;border-radius:50%;display:grid;place-items:center;font-weight:800;color:#fff;background:linear-gradient(135deg,#0ea5e9,#10b981)}
+.step b{display:block}
+.step span{color:var(--muted);font-size:15px}
+
+/* table */
+table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:16px;overflow:hidden}
+th,td{padding:12px 14px;text-align:left;border-bottom:1px solid var(--line);font-size:15px}
+th{background:var(--bg2);color:var(--muted);font-weight:600;font-size:13px;text-transform:uppercase;letter-spacing:.08em}
+tr:last-child td{border-bottom:0}
+.tag{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:700}
+.t-ok{background:color-mix(in srgb,var(--good) 18%,transparent);color:var(--good)}
+.t-wip{background:color-mix(in srgb,var(--warn) 20%,transparent);color:var(--warn)}
+.t-no{background:color-mix(in srgb,var(--muted) 18%,transparent);color:var(--muted)}
+.scroll{overflow-x:auto}
+
+/* code */
+.codebox{position:relative;background:var(--code);color:var(--codeink);border-radius:16px;padding:18px 18px 18px 20px;overflow-x:auto;font-size:14px;line-height:1.7;border:1px solid var(--line)}
+.codebox pre{margin:0}
+.copy{position:absolute;right:12px;top:12px;border:1px solid #2a3a63;background:#12204a;color:#dbe7ff;border-radius:8px;padding:5px 10px;font-size:12px;cursor:pointer}
+.copy:hover{background:#1b2d63}
+.c{color:#7b8cb2}
+
+.note{border:1px solid var(--line);border-left:4px solid var(--warn);background:var(--card);border-radius:14px;padding:16px 18px;color:var(--muted);font-size:15px}
+.note b{color:var(--ink)}
+.donate{display:flex;gap:10px;align-items:center;justify-content:center;flex-wrap:wrap;margin-top:14px}
+.addr{font-size:14px;background:var(--code);color:var(--codeink);padding:10px 14px;border-radius:10px;word-break:break-all;border:1px solid var(--line)}
+footer{padding:40px 0 60px;color:var(--muted);font-size:14px;text-align:center;border-top:1px solid var(--line)}
+footer p{max-width:760px;margin:6px auto}
+
+/* reveal */
+.rv{opacity:0;transform:translateY(22px);transition:opacity .7s ease,transform .7s ease}
+.rv.in{opacity:1;transform:none}
+@media(prefers-reduced-motion:reduce){
+  *{animation:none!important;transition:none!important}
+  .rv{opacity:1;transform:none}
+  html{scroll-behavior:auto}
+}
+[lang="de"] .en,[lang="en"] .de{display:none!important}
+</style>
+</head>
+<body>
+<div class="backdrop" aria-hidden="true"><i></i><i></i><i></i></div>
+
+<nav>
+  <div class="wrap">
+    <a class="brand" href="#top"><svg viewBox="0 0 64 64" aria-hidden="true"><path d="M32 6l20 8v17c0 12-9 21-20 26C21 52 12 43 12 31V14z" fill="none" stroke="#38bdf8" stroke-width="4"/><path d="M22 32l8 8 13-16" fill="none" stroke="#34d399" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/></svg>TSEM</a>
+    <span class="sp"></span>
+    <a class="l" href="#modes"><span class="en">Modes</span><span class="de">Modi</span></a>
+    <a class="l" href="#how"><span class="en">How it works</span><span class="de">Funktionsweise</span></a>
+    <a class="l" href="#hardware"><span class="en">Hardware</span><span class="de">Geräte</span></a>
+    <a class="l" href="#install"><span class="en">Install</span><span class="de">Installation</span></a>
+    <button class="pill" id="lang" type="button" aria-label="Language">DE</button>
+    <button class="pill" id="theme" type="button" aria-label="Theme">◐</button>
+    <a class="btn primary" style="padding:8px 14px;font-size:14px" href="https://github.com/mompl/glinet-tailscale-exit-manager">GitHub</a>
+  </div>
+</nav>
+
+<header class="hero" id="top">
+  <div class="wrap">
+    <span class="eyebrow en">Open source · Apache-2.0</span><span class="eyebrow de">Open Source · Apache-2.0</span>
+    <h1><span class="en">Your router. Your exit node.<br><span class="g">Never the wrong way out.</span></span><span class="de">Dein Router. Dein Exit-Node.<br><span class="g">Nie der falsche Weg nach draußen.</span></span></h1>
+    <p class="lead en">TSEM sends your whole LAN through the Tailscale exit node you chose, or directly, or nowhere at all. If the exit node fails, it switches to your backup. If both fail, it blocks. It never silently falls back to your own internet connection.</p>
+    <p class="lead de">TSEM schickt dein ganzes LAN über den Tailscale-Exit-Node, den du gewählt hast, oder direkt, oder gar nicht. Fällt der Exit-Node aus, wechselt es auf deinen Ersatz. Fallen beide aus, sperrt es. Es fällt nie stillschweigend auf deinen eigenen Internetanschluss zurück.</p>
+    <div class="cta">
+      <a class="btn primary" href="#install"><span class="en">Get started</span><span class="de">Loslegen</span> →</a>
+      <a class="btn" href="https://github.com/mompl/glinet-tailscale-exit-manager"><span class="en">View on GitHub</span><span class="de">Auf GitHub ansehen</span></a>
+    </div>
+    <div class="winframe rv">
+      <div class="winbar"><i></i><i></i><i></i><span class="en">Applications › Tailscale Exit Manager</span><span class="de">Anwendungen › Tailscale Exit Manager</span></div>
+      <iframe id="guiframe" title="TSEM interface (interactive demo with recorded replies)" loading="lazy" src="gui-demo.html"></iframe>
+      <p class="framenote en">This is the real TSEM interface file as it appears in the GL.iNet web UI, running here with recorded replies of the real controller. Try the buttons. It is not a live router.</p>
+      <p class="framenote de">Das ist die echte TSEM-Oberfläche, wie sie in der GL.iNet-Weboberfläche erscheint, hier mit aufgezeichneten Antworten des echten Controllers. Probiere die Knöpfe aus. Es ist kein echter Router.</p>
+    </div>
+  </div>
+</header>
+
+<section id="modes">
+  <div class="wrap">
+    <h2 class="rv"><span class="en">Three modes. No fourth.</span><span class="de">Drei Modi. Kein vierter.</span></h2>
+    <p class="sub rv en">Switch between them in the interface above, or use the demo controls to see what happens when an exit node fails.</p>
+    <p class="sub rv de">Wechsle in der Oberfläche oben zwischen ihnen, oder nutze die Demo-Leiste, um zu sehen, was bei einem Ausfall passiert.</p>
+    <div class="grid g3">
+      <div class="card rv"><div class="ico" style="color:var(--accent)">🌐</div><h3>DIRECT</h3><p class="en">Normal internet through your own connection. Nothing is rerouted. The kill switch is off.</p><p class="de">Normales Internet über deinen eigenen Anschluss. Nichts wird umgeleitet. Der Kill-Switch ist aus.</p></div>
+      <div class="card rv"><div class="ico" style="color:var(--good)">🛡️</div><h3>EXIT</h3><p class="en">All LAN traffic and the router's own traffic leave through your exit node. If it fails, the backup takes over.</p><p class="de">Der gesamte LAN-Verkehr und der des Routers geht über deinen Exit-Node. Fällt er aus, übernimmt der Ersatz.</p></div>
+      <div class="card rv"><div class="ico" style="color:var(--bad)">⛔</div><h3>BLOCKED</h3><p class="en">No usable exit node: nothing leaves, not even from the router. It never falls back to the open internet.</p><p class="de">Kein nutzbarer Exit-Node: nichts verlässt das Netz, auch nicht vom Router. Kein Rückfall ins offene Internet.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="how">
+  <div class="wrap">
+    <h2 class="rv"><span class="en">Built to fail closed</span><span class="de">Gebaut, um sicher zu sperren</span></h2>
+    <p class="sub rv en">Protection is not a button that can silently stop working. Two independent layers hold the line, and a failure leads to BLOCKED, not to the open internet.</p>
+    <p class="sub rv de">Der Schutz ist kein Schalter, der unbemerkt ausfallen kann. Zwei unabhängige Ebenen halten die Linie, und ein Fehler führt zu BLOCKED, nicht ins offene Internet.</p>
+    <div class="grid g3">
+      <div class="card rv"><div class="ico">🧱</div><h3 class="en">Two-layer kill switch</h3><h3 class="de">Kill-Switch in zwei Ebenen</h3><p class="en">A firewall guard and a routing deny rule work independently. Either one alone still blocks leaks.</p><p class="de">Eine Firewall-Sperre und eine Routing-Sperre arbeiten unabhängig. Jede allein verhindert schon Lecks.</p></div>
+      <div class="card rv"><div class="ico">🔁</div><h3 class="en">Automatic failover</h3><h3 class="de">Automatischer Failover</h3><p class="en">Primary down? The secondary takes over. Primary healthy again? It returns on its own, with hysteresis so it does not flap.</p><p class="de">Primary fällt aus? Der Ersatz übernimmt. Primary wieder gesund? Er kehrt selbst zurück, mit Hysterese gegen Flattern.</p></div>
+      <div class="card rv"><div class="ico">⏱️</div><h3 class="en">Guard before the network</h3><h3 class="de">Sperre vor dem Netzwerk</h3><p class="en">The saved mode is applied at boot before the network comes up, so a reboot is not a leak window.</p><p class="de">Der gespeicherte Modus gilt schon beim Start, bevor das Netzwerk hochkommt. Ein Neustart ist kein Zeitfenster für Lecks.</p></div>
+      <div class="card rv"><div class="ico">🧪</div><h3 class="en">Proof, not assumption</h3><h3 class="de">Nachweis statt Annahme</h3><p class="en">An exit node counts as usable only after real traffic through it works. "Reachable" is not enough.</p><p class="de">Ein Exit-Node gilt erst als nutzbar, wenn echter Verkehr darüber funktioniert. „Erreichbar" reicht nicht.</p></div>
+      <div class="card rv"><div class="ico">🔧</div><h3 class="en">Survives firmware updates</h3><h3 class="de">Übersteht Firmware-Updates</h3><p class="en">TSEM restores itself after a GL.iNet firmware upgrade and reinstalls the packages the upgrade removed.</p><p class="de">TSEM stellt sich nach einem GL.iNet-Firmware-Update selbst wieder her und installiert entfernte Pakete nach.</p></div>
+      <div class="card rv"><div class="ico">🖥️</div><h3 class="en">Many ways to control it</h3><h3 class="de">Viele Wege zur Steuerung</h3><p class="en">GL.iNet web UI, LuCI, command line, Home Assistant, and the hardware switch where your router has one.</p><p class="de">GL.iNet-Oberfläche, LuCI, Kommandozeile, Home Assistant und der Hardware-Schalter, wo dein Router einen hat.</p></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2 class="rv"><span class="en">Installs itself, adapts to your router</span><span class="de">Installiert sich selbst, passt sich deinem Router an</span></h2>
+    <p class="sub rv en">One script, six checked steps. If anything fails, it puts the router back as it was.</p><p class="sub rv de">Ein Skript, sechs geprüfte Schritte. Schlägt etwas fehl, stellt es den Router wieder her.</p>
+    <div class="steps">
+      <div class="step rv"><b class="en">Checks the router</b><b class="de">Prüft den Router</b><span class="en">Tools, Tailscale, GL.iNet UI, free space, IPv6 firewall tool, an exit node you already use.</span><span class="de">Werkzeuge, Tailscale, GL.iNet-Oberfläche, Speicher, IPv6-Firewall-Werkzeug, bereits genutzter Exit-Node.</span></div>
+      <div class="step rv"><b class="en">Installs in one transaction</b><b class="de">Installiert in einer Transaktion</b><span class="en">Any failure restores the previous state.</span><span class="de">Jeder Fehler stellt den vorherigen Zustand wieder her.</span></div>
+      <div class="step rv"><b class="en">Finds your exit nodes</b><b class="de">Findet deine Exit-Nodes</b><span class="en">Names come from Tailscale, nothing is hard coded.</span><span class="de">Die Namen kommen von Tailscale, nichts ist fest eingetragen.</span></div>
+      <div class="step rv"><b class="en">Runs a self test</b><b class="de">Macht einen Selbsttest</b><span class="en">Firewall, routing, boot order, hooks.</span><span class="de">Firewall, Routing, Startreihenfolge, Hooks.</span></div>
+      <div class="step rv"><b class="en">Starts in DIRECT and proves it</b><b class="de">Startet in DIRECT und beweist es</b><span class="en">The router must still reach the internet, or everything is rolled back.</span><span class="de">Der Router muss weiter ins Internet kommen, sonst wird alles zurückgenommen.</span></div>
+      <div class="step rv"><b class="en">Optionally goes protected</b><b class="de">Schaltet auf Wunsch den Schutz ein</b><span class="en">Only with <code>--exit</code>, and back to DIRECT if the exit node does not come up.</span><span class="de">Nur mit <code>--exit</code>, und zurück auf DIRECT, wenn der Exit-Node nicht hochkommt.</span></div>
+    </div>
+  </div>
+</section>
+
+<section id="hardware">
+  <div class="wrap">
+    <h2 class="rv"><span class="en">Honest hardware status</span><span class="de">Ehrlicher Gerätestatus</span></h2>
+    <p class="sub rv en">What has really been tested, and what has not. No device is listed as working until it was tested on that device.</p><p class="sub rv de">Was wirklich getestet wurde und was nicht. Kein Gerät gilt als funktionierend, bevor es auf genau diesem Gerät getestet wurde.</p>
+    <div class="scroll rv"><table>
+      <thead><tr><th>Router</th><th>Model</th><th class="en">Status</th><th class="de">Stand</th></tr></thead>
+      <tbody>
+        <tr><td>Beryl AX</td><td>GL-MT3000</td><td><span class="tag t-ok en">tested</span><span class="tag t-ok de">getestet</span></td></tr>
+        <tr><td>Mango 2</td><td>GL-MG1300</td><td><span class="tag t-ok en">tested, incl. firmware upgrade and reboot</span><span class="tag t-ok de">getestet, inkl. Firmware-Update und Neustart</span></td></tr>
+        <tr><td>Mudi 7</td><td>GL-E5800</td><td><span class="tag t-wip en">in testing</span><span class="tag t-wip de">wird getestet</span></td></tr>
+        <tr><td>Spitz AX</td><td>GL-X3000</td><td><span class="tag t-no en">not tested</span><span class="tag t-no de">nicht getestet</span></td></tr>
+        <tr><td class="en">Other OpenWrt routers</td><td class="de">Andere OpenWrt-Router</td><td>—</td><td><span class="tag t-no en">may work, the installer checks first</span><span class="tag t-no de">können funktionieren, das Setup prüft vorher</span></td></tr>
+      </tbody>
+    </table></div>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <h2 class="rv"><span class="en">Install</span><span class="de">Installation</span></h2>
+    <p class="sub rv en">You need a GL.iNet or OpenWrt router with iptables, Tailscale installed, logged in and running, and at least one approved exit node in your tailnet.</p>
+    <p class="sub rv de">Du brauchst einen GL.iNet- oder OpenWrt-Router mit iptables, Tailscale (installiert, angemeldet, läuft) und mindestens einen freigegebenen Exit-Node in deinem Tailnet.</p>
+    <div class="codebox rv"><button class="copy" type="button" data-copy="install">copy</button>
+<pre id="install-code"><span class="c"># on your computer: copy the release archive to the router and unpack it</span>
+scp tsem-&lt;version&gt;.tar.gz root@192.168.8.1:/tmp/
+ssh root@192.168.8.1
+cd /tmp &amp;&amp; tar xzf tsem-&lt;version&gt;.tar.gz &amp;&amp; cd tsem-&lt;version&gt;
+
+<span class="c"># interactive: it asks only for your exit nodes</span>
+sh setup.sh
+
+<span class="c"># or without questions</span>
+sh setup.sh --yes --primary my-exit-node --secondary my-backup-node</pre></div>
+    <p class="sub rv en" style="margin-top:18px">Release archives and checksums are on the <a href="https://github.com/mompl/glinet-tailscale-exit-manager/releases">Releases</a> page. Always keep a way to reach the router that does not depend on TSEM.</p>
+    <p class="sub rv de" style="margin-top:18px">Release-Archive und Prüfsummen findest du unter <a href="https://github.com/mompl/glinet-tailscale-exit-manager/releases">Releases</a>. Halte immer einen Zugang zum Router bereit, der nicht von TSEM abhängt.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap" style="max-width:820px">
+    <div class="note rv">
+      <p style="margin:0 0 8px"><b class="en">No warranty, use at your own risk.</b><b class="de">Keine Gewährleistung, Nutzung auf eigene Gefahr.</b></p>
+      <p style="margin:0" class="en">TSEM changes the firewall and routing rules of your router. It is built to fail closed, but no software can guarantee that nothing ever leaks. Test it yourself with your router, firmware and clients. It is provided "as is" under the Apache License 2.0 without warranty, and the author is not liable for any damage or consequence of its use.</p>
+      <p style="margin:0" class="de">TSEM verändert die Firewall- und Routing-Regeln deines Routers. Es ist so gebaut, dass es im Zweifel sperrt, aber keine Software kann garantieren, dass nie etwas durchsickert. Teste es selbst mit deinem Router, deiner Firmware und deinen Geräten. Es wird „wie besehen" unter der Apache License 2.0 ohne Gewährleistung bereitgestellt, und der Autor haftet nicht für Schäden oder Folgen der Nutzung.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap" style="max-width:820px;text-align:center">
+    <h2 class="rv"><span class="en">Support the project</span><span class="de">Das Projekt unterstützen</span></h2>
+    <p class="sub rv en">TSEM is free software. If it is useful to you, you can support it with a voluntary Bitcoin donation. A donation is a gift and creates no claim to support, features or warranty.</p>
+    <p class="sub rv de">TSEM ist freie Software. Wenn es dir nützt, kannst du es freiwillig mit Bitcoin unterstützen. Eine Spende ist ein Geschenk und begründet keinen Anspruch auf Support, Funktionen oder Gewährleistung.</p>
+    <div class="donate rv">
+      <code class="addr" id="btc">bc1quh4ucr0atp8h8q9xrzxvysypz0py3m8vpp0rny</code>
+      <button class="btn" type="button" id="btccopy"><span class="en">Copy address</span><span class="de">Adresse kopieren</span></button>
+    </div>
+    <p class="sub rv en" style="margin-top:14px;font-size:14px">Please compare the address with the one in the repository README before you send anything.</p>
+    <p class="sub rv de" style="margin-top:14px;font-size:14px">Bitte vergleiche die Adresse mit der in der README des Repositorys, bevor du etwas sendest.</p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p><a href="https://github.com/mompl/glinet-tailscale-exit-manager">GitHub</a> · <a href="https://github.com/mompl/glinet-tailscale-exit-manager/blob/main/LICENSE">Apache-2.0</a> · <a href="https://github.com/mompl/glinet-tailscale-exit-manager/blob/main/SECURITY.md">Security</a> · <a href="https://github.com/mompl/glinet-tailscale-exit-manager/blob/main/CONTRIBUTING.md">Contributing</a></p>
+    <p class="en">Copyright 2026 mompl. Independent project, not affiliated with or endorsed by Tailscale, GL.iNet, OpenWrt or Home Assistant. All names are trademarks of their owners.</p>
+    <p class="de">Copyright 2026 mompl. Unabhängiges Projekt, nicht verbunden mit oder gebilligt von Tailscale, GL.iNet, OpenWrt oder Home Assistant. Alle Namen sind Marken ihrer Inhaber.</p>
+  </div>
+</footer>
+
+<script>
+(function(){
+  var root=document.documentElement;
+  function store(k,v){try{if(v===undefined)return localStorage.getItem(k);localStorage.setItem(k,v)}catch(e){return null}}
+  /* language */
+  var lang=store('tsem-lang')||((navigator.language||'en').toLowerCase().indexOf('de')===0?'de':'en');
+  function setLang(l){lang=l;root.setAttribute('lang',l);document.getElementById('lang').textContent=l==='de'?'EN':'DE';store('tsem-lang',l);caption()}
+  document.getElementById('lang').addEventListener('click',function(){setLang(lang==='de'?'en':'de')});
+  /* theme */
+  var th=store('tsem-theme');if(th)root.setAttribute('data-theme',th);
+  document.getElementById('theme').addEventListener('click',function(){
+    var cur=root.getAttribute('data-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');
+    var n=cur==='dark'?'light':'dark';root.setAttribute('data-theme',n);store('tsem-theme',n)});
+  /* the real interface speaks the page language */
+  function caption(){var f=document.getElementById('guiframe');if(!f)return;var u='gui-demo.html?lang='+lang;if(f.getAttribute('data-l')!==lang){f.setAttribute('data-l',lang);f.src=u}}
+  setLang(lang);
+  /* copy buttons */
+  function copy(text,btn,label){
+    function done(){var o=btn.textContent;btn.textContent='✓';setTimeout(function(){btn.textContent=o},1400)}
+    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(done,function(){})}
+    else{var t=document.createElement('textarea');t.value=text;document.body.appendChild(t);t.select();try{document.execCommand('copy');done()}catch(e){}document.body.removeChild(t)}
+  }
+  document.querySelector('[data-copy="install"]').addEventListener('click',function(e){copy(document.getElementById('install-code').innerText,e.currentTarget)});
+  document.getElementById('btccopy').addEventListener('click',function(e){copy(document.getElementById('btc').textContent.trim(),e.currentTarget)});
+  /* reveal on scroll */
+  var els=document.querySelectorAll('.rv');
+  if('IntersectionObserver' in window){
+    var io=new IntersectionObserver(function(es){es.forEach(function(x){if(x.isIntersecting){x.target.classList.add('in');io.unobserve(x.target)}})},{threshold:.12});
+    [].forEach.call(els,function(e,i){e.style.transitionDelay=(i%3)*80+'ms';io.observe(e)});
+  }else{[].forEach.call(els,function(e){e.classList.add('in')})}
+})();
+</script>
+</body>
+</html>

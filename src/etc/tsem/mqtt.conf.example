@@ -1,0 +1,12 @@
+# Home Assistant MQTT bridge (tsem-mqtt). Copy to /etc/tsem/mqtt.conf (mode 600).
+# The password lives in a SEPARATE file (mode 600), never on a command line.
+MQTT_HOST=192.168.1.10
+MQTT_PORT=1883
+MQTT_USER=tsem
+MQTT_PASSFILE=/etc/tsem/mqtt.pass
+MQTT_TLS=0
+MQTT_CAFILE=
+MQTT_BASE=tsem/root
+MQTT_DISCOVERY=homeassistant
+MQTT_ID=root
+MQTT_INTERVAL=10

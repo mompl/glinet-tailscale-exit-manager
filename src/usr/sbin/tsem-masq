@@ -1,0 +1,189 @@
+#!/bin/sh
+# tsem-masq - keep the LAN -> tailscale0 source NAT (masquerading) of the GL.iNet firewall in place.
+#
+# Why: the GL.iNet firmware creates/rewrites the fw3 zone "tailscale0" with masq=0 (stock default, also
+# after Tailscale/firewall/captive-portal events); without NAT the replies of private tailnet subnets
+# (e.g. the remote-site networks) do not return. This tool restores ONLY that: option masq=1 of the zone and the
+# live MASQUERADE rule in its postrouting chain. It is independent of the tsem kill switch: it never
+# touches TSEM_FWD / TSEM_OUT / ip rules / exit nodes, never adds an ACCEPT rule, never creates a zone or
+# a forwarding and never changes WAN rules. It works with tsem installed, stopped or not installed at all.
+#
+#   tsem-masq check              read-only; rc 0 = consistent, 1 = drift, 3 = not applicable (no uci/zone)
+#   tsem-masq ensure [--no-reload]   repair (idempotent; writes nothing when everything is already right)
+#   tsem-masq watch              reconcile every TSEM_MASQ_INTERVAL seconds (default 300), reads only
+#
+# Writes (only when drift is found): uci firewall.<zone>.masq=1 + commit (config backed up once first),
+# one iptables rule in zone_<zone>_postrouting (comment "tsem-masq"), at most one firewall reload per
+# TSEM_MASQ_RELOAD_GAP seconds, and only when the zone chain is missing. `--no-reload` or
+# TSEM_MASQ_NORELOAD=1 (used inside the fw3 include, where a reload would recurse) never reloads.
+#
+# Environment (tests): TSEM_MASQ_UCI, TSEM_MASQ_IPT, TSEM_MASQ_FWINIT, TSEM_MASQ_RUN, TSEM_MASQ_BACKUP,
+# TSEM_MASQ_ZONE, TSEM_MASQ_LOG=0.
+
+set -u
+UCI=${TSEM_MASQ_UCI:-uci}
+IPT=${TSEM_MASQ_IPT:-iptables}
+FWINIT=${TSEM_MASQ_FWINIT:-/etc/init.d/firewall}
+RUN=${TSEM_MASQ_RUN:-/var/run/tsem-masq}
+BACKUP=${TSEM_MASQ_BACKUP:-/etc/tsem/backup/masq}
+ZONE=${TSEM_MASQ_ZONE:-tailscale0}
+GAP=${TSEM_MASQ_RELOAD_GAP:-120}
+INTERVAL=${TSEM_MASQ_INTERVAL:-300}
+CHAIN=zone_${ZONE}_postrouting
+NORELOAD=${TSEM_MASQ_NORELOAD:-0}
+
+say() { printf '%s\n' "$*"; }
+log() {
+	say "masq: $*"
+	[ "${TSEM_MASQ_LOG:-1}" = 0 ] || logger -t tsem-masq "$*" 2>/dev/null || true
+}
+
+# section id of the firewall zone with name=$ZONE ("" if none)
+zone_section() {
+	"$UCI" -q show firewall 2>/dev/null | awk -v z="$ZONE" '
+		{
+			line = $0
+			if (match(line, /^firewall\.[^.=]+=zone$/)) { s = substr(line, 10); sub(/=zone$/, "", s); type[s] = 1; next }
+			if (match(line, /^firewall\.[^.=]+\.name=/)) {
+				s = substr(line, 10); sub(/\.name=.*$/, "", s)
+				v = line; sub(/^[^=]*=/, "", v); gsub(/\047/, "", v)
+				if (v == z) name[s] = 1
+			}
+		}
+		END { for (s in name) if (s in type) { print s; exit } }'
+}
+
+# yes/no: an enabled forwarding lan -> $ZONE is configured (report only; never created here)
+lan_forwarding() {
+	"$UCI" -q show firewall 2>/dev/null | awk -v z="$ZONE" '
+		{
+			line = $0; key = line; sub(/=.*$/, "", key); val = line; sub(/^[^=]*=/, "", val); gsub(/\047/, "", val)
+			if (key ~ /^firewall\.[^.]+$/) { if (val == "forwarding") fwd[substr(key, 10)] = 1; next }
+			n = key; sub(/^firewall\.[^.]+\./, "", n); s = key; sub(/^firewall\./, "", s); sub(/\..*$/, "", s)
+			if (n == "src") src[s] = val; else if (n == "dest") dst[s] = val; else if (n == "enabled") en[s] = val
+		}
+		END { for (s in fwd) if (src[s] == "lan" && dst[s] == z && en[s] != "0") { print "yes"; exit } print "no" }'
+}
+
+nat_state() { # prints: nochain | none | ok:<n>  (n = number of MASQUERADE rules in the zone chain)
+	_ns=$("$IPT" -t nat -S "$CHAIN" 2>/dev/null) || { echo nochain; return 0; }
+	_n=$(printf '%s\n' "$_ns" | grep -c -e '^-A .* -j MASQUERADE')
+	if [ "$_n" -gt 0 ]; then echo "ok:$_n"; else echo none; fi
+}
+
+report() { # sets SEC MASQ FWD NAT
+	SEC=$(zone_section)
+	MASQ=''
+	[ -z "$SEC" ] || MASQ=$("$UCI" -q get "firewall.$SEC.masq" 2>/dev/null)
+	FWD=$(lan_forwarding)
+	NAT=$(nat_state)
+}
+
+cmd_check() {
+	command -v "$UCI" >/dev/null 2>&1 || { say "SKIP masq.uci   uci not available"; return 3; }
+	report
+	[ -n "$SEC" ] || { say "SKIP masq.uci   no firewall zone '$ZONE' (nothing to repair; not created by this tool)"; return 3; }
+	_rc=0
+	if [ "$MASQ" = 1 ]; then say "PASS  masq.uci   firewall.$SEC ($ZONE) masq=1"; else say "FAIL  masq.uci   firewall.$SEC ($ZONE) masq='${MASQ:-unset}' (expected 1)"; _rc=1; fi
+	case $NAT in
+	ok:*) say "PASS  masq.nat   $CHAIN has MASQUERADE (${NAT#ok:} rule(s))" ;;
+	none) say "FAIL  masq.nat   $CHAIN exists but has no MASQUERADE rule"; _rc=1 ;;
+	nochain) say "FAIL  masq.nat   chain $CHAIN does not exist (zone not loaded by fw3)"; _rc=1 ;;
+	esac
+	if [ "$FWD" = yes ]; then say "PASS  masq.forward   forwarding lan -> $ZONE configured"; else say "WARN  masq.forward   no enabled forwarding lan -> $ZONE (not created by tsem-masq)"; fi
+	return "$_rc"
+}
+
+lock_take() {
+	mkdir -p "$RUN" 2>/dev/null || return 1
+	_lk=$RUN/lock
+	if ! mkdir "$_lk" 2>/dev/null; then
+		# stale lock (a killed run): older than 60 s
+		_age=$(( $(date +%s) - $(stat -c %Y "$_lk" 2>/dev/null || echo 0) ))
+		if [ "$_age" -gt 60 ]; then rm -rf "$_lk"; mkdir "$_lk" 2>/dev/null || return 1; else return 1; fi
+	fi
+	return 0
+}
+lock_drop() { rmdir "$RUN/lock" 2>/dev/null; }
+
+backup_once() {
+	[ -f /etc/config/firewall ] || [ -n "${TSEM_MASQ_FWCONF:-}" ] || return 0
+	_src=${TSEM_MASQ_FWCONF:-/etc/config/firewall}
+	[ -f "$_src" ] || return 0
+	mkdir -p "$BACKUP" 2>/dev/null || return 0
+	cp -p "$_src" "$BACKUP/firewall.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+}
+
+cmd_ensure() {
+	command -v "$UCI" >/dev/null 2>&1 || { say "masq: uci not available; nothing to do"; return 3; }
+	lock_take || { say "masq: another run is active; skipping"; return 0; }
+	ensure_body
+	_er=$?
+	lock_drop
+	return "$_er"
+}
+
+ensure_body() {
+	report
+	[ -n "$SEC" ] || { say "masq: no firewall zone '$ZONE'; nothing to do (zones are not created by this tool)"; return 3; }
+	_changed=0
+	if [ "$MASQ" != 1 ]; then
+		backup_once
+		"$UCI" -q set "firewall.$SEC.masq=1" && "$UCI" -q commit firewall || { log "ERROR: could not set masq=1 on firewall.$SEC"; return 1; }
+		log "repaired: firewall.$SEC ($ZONE) masq '${MASQ:-unset}' -> 1"
+		_changed=1
+	fi
+	NAT=$(nat_state)
+	case $NAT in
+	ok:*)
+		# fw3's own rule exists: drop our duplicate (if we added one earlier) so fw3 stays the only owner
+		if [ "${NAT#ok:}" -gt 1 ] && "$IPT" -t nat -C "$CHAIN" -m comment --comment tsem-masq -j MASQUERADE 2>/dev/null; then
+			"$IPT" -t nat -D "$CHAIN" -m comment --comment tsem-masq -j MASQUERADE 2>/dev/null && log "removed duplicate tsem-masq rule (fw3 rule present)"
+		fi
+		;;
+	none)
+		"$IPT" -t nat -A "$CHAIN" -m comment --comment tsem-masq -j MASQUERADE 2>/dev/null || { log "ERROR: could not add the MASQUERADE rule to $CHAIN"; return 1; }
+		log "repaired: added MASQUERADE to $CHAIN (until the next fw3 reload; masq=1 is in UCI)"
+		;;
+	nochain)
+		if [ "$NORELOAD" = 1 ]; then
+			log "chain $CHAIN missing; reload suppressed here (UCI masq=1 is set; fw3 builds it on the next load)"
+		elif [ ! -x "$FWINIT" ]; then
+			log "chain $CHAIN missing and $FWINIT not executable"; return 1
+		else
+			_now=$(date +%s)
+			_last=$(cat "$RUN/last_reload" 2>/dev/null || echo 0)
+			if [ $((_now - _last)) -lt "$GAP" ]; then
+				log "chain $CHAIN missing; reload rate limit (${GAP}s) not elapsed"; return 1
+			fi
+			echo "$_now" >"$RUN/last_reload"
+			log "chain $CHAIN missing: one firewall reload"
+			"$FWINIT" reload >/dev/null 2>&1 || { log "ERROR: firewall reload failed"; return 1; }
+			NAT=$(nat_state)
+			case $NAT in ok:*) ;; *) log "chain still without MASQUERADE after the reload"; return 1 ;; esac
+		fi
+		;;
+	esac
+	[ "$_changed" -eq 1 ] || say "masq: consistent (no change)"
+	return 0
+}
+
+cmd_watch() {
+	while :; do
+		cmd_ensure >/dev/null 2>&1 || true
+		sleep "$INTERVAL"
+	done
+}
+
+main() {
+	_c=${1:-}
+	[ $# -eq 0 ] || shift
+	for _a in "$@"; do [ "$_a" = --no-reload ] && NORELOAD=1; done
+	case $_c in
+	check) cmd_check ;;
+	ensure) cmd_ensure ;;
+	watch) cmd_watch ;;
+	*) sed -n '2,24p' "$0"; return 64 ;;
+	esac
+}
+main "$@"

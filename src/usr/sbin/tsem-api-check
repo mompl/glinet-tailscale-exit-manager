@@ -1,0 +1,86 @@
+#!/bin/sh
+# tsem-api-check: READ-ONLY check of the local API's security properties on this router.
+#   tsem-api-check [--url http://HOST:PORT]
+# Prints one line per check: PASS | FAIL | WARN | UNVERIFIED  name: detail
+# and API_CHECK=ok|fail as the last line (exit 1 on any FAIL). It never changes a setting: the
+# "unauthenticated write" probe is a deliberately invalid config_set, which changes nothing even if it got through.
+
+PLUGIN=${TSEM_PLUGIN:-/usr/libexec/rpcd/tsem}
+ACL=${TSEM_ACL:-/usr/share/rpcd/acl.d/tsem.json}
+NULL=00000000000000000000000000000000
+URL=''
+[ "${1:-}" != --url ] || URL=${2:-}
+FAILS=0
+
+res() { printf '%s %s: %s\n' "$1" "$2" "$3"; [ "$1" != FAIL ] || FAILS=$((FAILS + 1)); }
+
+# --- 1. plugin and ACL are installed
+if [ -x "$PLUGIN" ] && "$PLUGIN" list 2>/dev/null | grep -q '"set_mode"'; then res PASS plugin "$PLUGIN lists its methods"; else res FAIL plugin "$PLUGIN missing or not executable"; fi
+if [ -r "$ACL" ]; then
+	if grep -q '"\*"' "$ACL" || grep -qi unauthenticated "$ACL"; then res FAIL acl "wildcard or unauthenticated grant in $ACL"; else res PASS acl "$ACL: no wildcard, no unauthenticated grant"; fi
+	if grep -q '"tsem-read"' "$ACL" && grep -q '"tsem-write"' "$ACL"; then res PASS acl-groups "tsem-read and tsem-write present"; else res FAIL acl-groups "tsem-read / tsem-write missing"; fi
+else
+	res FAIL acl "$ACL missing"
+fi
+
+# --- 2. the ubus object exists
+if command -v ubus >/dev/null 2>&1; then
+	if ubus list tsem 2>/dev/null | grep -q 'set_mode'; then res PASS ubus-object "ubus object tsem is registered"; else res FAIL ubus-object "ubus list tsem shows no methods (rpcd must reload/restart)"; fi
+else
+	res UNVERIFIED ubus-object "ubus not available"
+fi
+
+# --- 3. HTTP endpoint: unauthenticated access must be refused
+rpc() { # session object method json -> body
+	curl -s -m 6 -H 'Content-Type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"call\",\"params\":[\"$1\",\"$2\",\"$3\",$4]}" "$ENDPOINT/ubus" 2>/dev/null
+}
+candidates=''
+if [ -n "$URL" ]; then candidates=$URL
+else
+	if command -v uci >/dev/null 2>&1; then
+		for l in $(uci -q get uhttpd.main.listen_http 2>/dev/null); do
+			port=${l##*:}
+			case $port in '' | *[!0-9]*) ;; *) candidates="$candidates http://127.0.0.1:$port" ;; esac
+		done
+	fi
+	candidates="$candidates http://127.0.0.1:80 http://127.0.0.1:8080"
+fi
+ENDPOINT=''
+if command -v curl >/dev/null 2>&1; then
+	for c in $candidates; do
+		ENDPOINT=$c
+		out=$(rpc "$NULL" session login '{"username":"tsem-check-no-such-user","password":"x"}')
+		case $out in *'"jsonrpc"'*) break ;; esac
+		ENDPOINT=''
+	done
+fi
+if [ -z "$ENDPOINT" ]; then
+	res WARN http-endpoint "no HTTP ubus endpoint found ($candidates); GUI/Home Assistant need one (LuCI/uhttpd)"
+else
+	res PASS http-endpoint "$ENDPOINT/ubus answers"
+	out=$(rpc "$NULL" session login '{"username":"tsem-check-no-such-user","password":"x"}')
+	case $out in *'"result":[0'*) res FAIL login-refused "a bogus user could log in" ;; *) res PASS login-refused "bogus login refused" ;; esac
+	out=$(rpc "$NULL" tsem status '{}')
+	case $out in *'"ok":true'*) res FAIL unauth-read "status readable WITHOUT a session" ;; *) res PASS unauth-read "unauthenticated read refused" ;; esac
+	out=$(rpc "$NULL" tsem config_set '{"primary":"not-an-ip"}')
+	case $out in *'"ok":'*) res FAIL unauth-write "the write method ANSWERED without a session" ;; *) res PASS unauth-write "unauthenticated write refused" ;; esac
+	port=${ENDPOINT##*:}
+	# --- 4. not reachable from WAN
+	case $port in '' | *[!0-9]*) res UNVERIFIED wan-exposure "cannot determine the port" ;; *)
+		if command -v iptables >/dev/null 2>&1 && iptables -S zone_wan_input >/dev/null 2>&1; then
+			if iptables -S zone_wan_input 2>/dev/null | grep -E -- "--dport $port( |$)" | grep -q -- '-j ACCEPT\|-j zone_wan_src_ACCEPT'; then
+				res FAIL wan-exposure "firewall accepts WAN traffic to port $port"
+			elif iptables -S zone_wan_input 2>/dev/null | tail -n 1 | grep -q 'zone_wan_src_ACCEPT'; then
+				res FAIL wan-exposure "the WAN zone accepts input by default"
+			else
+				res PASS wan-exposure "zone_wan_input has no accept for port $port"
+			fi
+		else
+			res UNVERIFIED wan-exposure "no zone_wan_input chain to inspect (check the firewall by hand)"
+		fi ;;
+	esac
+fi
+
+if [ "$FAILS" -eq 0 ]; then echo API_CHECK=ok; exit 0; fi
+echo API_CHECK=fail
+exit 1
