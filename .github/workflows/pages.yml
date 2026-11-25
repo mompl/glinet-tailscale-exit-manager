@@ -26,9 +26,9 @@ jobs:
       - name: Keep the page copy of the real interface file in sync
         run: |
           cp src/www/views/gl-sdk4-ui-tsem.common.js site/gui-bundle.js
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v4
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: site
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
