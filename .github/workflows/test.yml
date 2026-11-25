@@ -48,8 +48,8 @@ jobs:
           command -v lua5.4 >/dev/null || command -v lua5.3 >/dev/null || command -v lua >/dev/null || { echo "::error::no Lua interpreter"; exit 1; }
           tar --help 2>&1 | grep -c -- --sort >/dev/null || { command -v apk >/dev/null 2>&1 && apk add --no-cache tar; }; tar --help 2>&1 | grep -c -- --sort >/dev/null || { echo "::error::GNU tar (--sort) missing"; exit 1; }; python3 --version; node --version; curl --version | head -n 1
       - name: Unit + installer tests (dash)
-        run: SH=dash sh tests/run.sh
+        run: sudo -E env "PATH=$PATH" SH=dash sh tests/run.sh
       - name: Unit + installer tests (bash)
-        run: SH=bash sh tests/run.sh
+        run: sudo -E env "PATH=$PATH" SH=bash sh tests/run.sh
       - name: Collector tests
         run: sh tools/test-collect.sh

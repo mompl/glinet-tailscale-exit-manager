@@ -199,7 +199,7 @@ test_installed_api_answers_through_the_installed_controller() {
 
 # ---------------------------------------------------------------- firmware-upgrade protection
 _wipe_like_sysupgrade() { # what a sysupgrade removes: everything except the kept files
-	rm -rf "$RT/usr" "$RT/www" "$RT/etc/init.d/tsem" "$RT/etc/init.d/tsem-masq" "$RT/etc/hotplug.d" "$RT/etc/rc.d/S18tsem" "$RT/etc/rc.d/K10tsem" "$RT/etc/gl-switch.d/tailscale-de.sh" "$RT/etc/gl-switch.d/tsem"* "$RT/etc/rcd-keep-check"
+	rm -rf "${RT:?}/usr" "${RT:?}/www" "$RT/etc/init.d/tsem" "$RT/etc/init.d/tsem-masq" "$RT/etc/hotplug.d" "$RT/etc/rc.d/S18tsem" "$RT/etc/rc.d/K10tsem" "$RT/etc/gl-switch.d/tailscale-de.sh" "$RT/etc/gl-switch.d/tsem"* "$RT/etc/rcd-keep-check"
 }
 
 test_install_keeps_a_package_copy_and_lists_it_for_sysupgrade() {
