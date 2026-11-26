@@ -111,7 +111,7 @@ test_upgrade_from_rc3_keeps_config_intent_and_extnet_routes_and_is_reversible() 
 	TSEM_INSTALL_STAMP=20260101-000005 inst --yes --enable || fail "upgrade failed: $(cat "$T/inst.out")"
 	assert_eq conf "$_conf" "$(md5sum <"$RT/etc/tsem/tsem.conf")"
 	assert_eq intent "$_intent" "$(md5sum <"$RT/etc/tsem/intent")"
-	assert_eq version 1.0.0 "$(sed -n 's/^version=//p' "$RT/etc/tsem/install.manifest")"
+	assert_eq version 1.1.0 "$(sed -n 's/^version=//p' "$RT/etc/tsem/install.manifest")"
 	[ -x "$RT/usr/libexec/rpcd/tsem" ] || fail "api missing after upgrade"
 	[ -L "$RT/etc/rc.d/S18tsem" ] || fail "boot link lost"
 	grep -q "10.30.2.0/24" "$RT/etc/tsem/tsem.conf" || fail "remote-site subnets lost"
@@ -214,6 +214,12 @@ test_install_keeps_a_package_copy_and_lists_it_for_sysupgrade() {
 	assert_contains keep1 "/etc/tsem/" "$_c"
 	assert_contains keep2 "/etc/init.d/tsem-restore" "$_c"
 	assert_contains keep3 "/etc/rc.d/S17tsem-restore" "$_c"
+	# the same list as a firmware keep.d file (honoured even where /etc/sysupgrade.conf is reset), and it keeps itself
+	_k=$(cat "$RT/lib/upgrade/keep.d/tsem" 2>/dev/null)
+	assert_contains kd1 "/etc/tsem/" "$_k"
+	assert_contains kd2 "/etc/init.d/tsem-restore" "$_k"
+	assert_contains kd3 "/etc/rc.d/S17tsem-restore" "$_k"
+	assert_contains kd4 "/lib/upgrade/keep.d/tsem" "$_k"
 	# idempotent: a second install keeps exactly one block
 	TSEM_INSTALL_STAMP=20260101-000002 inst --yes || fail "second install failed"
 	assert_eq "one block" 1 "$(grep -c 'tsem-keep-begin' "$RT/etc/sysupgrade.conf")"
@@ -223,7 +229,7 @@ test_install_keeps_a_package_copy_and_lists_it_for_sysupgrade() {
 test_no_upgrade_keep_option_adds_nothing() {
 	_inst_helpers; mkroot
 	inst --yes --no-upgrade-keep || fail "install failed"
-	[ ! -e "$RT/etc/tsem/pkg" ] && [ ! -e "$RT/etc/sysupgrade.conf" ] && [ ! -e "$RT/etc/rc.d/S17tsem-restore" ] || fail "upgrade protection present despite --no-upgrade-keep"
+	[ ! -e "$RT/etc/tsem/pkg" ] && [ ! -e "$RT/etc/sysupgrade.conf" ] && [ ! -e "$RT/lib/upgrade/keep.d/tsem" ] && [ ! -e "$RT/etc/rc.d/S17tsem-restore" ] || fail "upgrade protection present despite --no-upgrade-keep"
 }
 
 test_rollback_and_uninstall_remove_the_upgrade_protection() {
@@ -242,6 +248,7 @@ test_rollback_and_uninstall_remove_the_upgrade_protection() {
 	[ ! -e "$RT/etc/init.d/tsem-restore" ] || fail "restore init script left after uninstall"
 	if grep -q tsem "$RT/etc/sysupgrade.conf"; then fail "keep list left after uninstall"; fi
 	assert_contains user "/etc/dropbear/" "$(cat "$RT/etc/sysupgrade.conf")"
+	[ ! -e "$RT/lib/upgrade/keep.d/tsem" ] || fail "keep.d file left after uninstall"
 }
 
 test_restore_after_a_simulated_upgrade_brings_back_tsem_and_keeps_the_intent() {

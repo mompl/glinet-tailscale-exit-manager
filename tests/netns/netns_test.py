@@ -35,7 +35,7 @@ NET = os.CLONE_NEWNET
 INTERNET = "203.0.113.9"
 EXTNET_NETS = ["10.30.0.0/24", "10.30.1.0/24", "10.30.2.0/24"]
 EXTNET = ["10.30.0.10", "10.30.1.10", "10.30.2.10"]
-OTHER_PRIVATE_NET, OTHER_PRIVATE = "10.77.0.0/24", "10.77.0.10"  # private, advertised, but NOT allowed by config
+OTHER_PRIVATE_NET, OTHER_PRIVATE = "10.60.0.0/24", "10.60.0.10"  # private, advertised, but NOT allowed by config
 
 
 class Fail(Exception):
@@ -165,7 +165,7 @@ def serve_tcp(token, port):
 
 def serve_private(token, port, need_prefix, addrs):
     """Responder for a remote private network (remote-site): answers ONLY when the source address
-    starts with need_prefix. Without SNAT the client's 10.82.x source is not routable there,
+    starts with need_prefix. Without SNAT the client's 10.50.x source is not routable there,
     so a missing MASQUERADE shows up as 'no answer'. UDP is bound per address so that the
     reply carries the address that was asked (needed for conntrack/un-NAT)."""
     socks = []

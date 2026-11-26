@@ -24,7 +24,7 @@ var TEXTS = {
 		'r.leak': 'LEAK RISK: the protection is not fully installed. Check the diagnostics.',
 		'r.inconsistent': 'The firewall guard is in an inconsistent state.',
 		'r.node_mismatch': 'Tailscale reports a different exit node than the controller expects',
-		active_exit: 'Active exit node', none: 'none', primary: 'Primary', secondary: 'Secondary',
+		active_exit: 'Active exit node', none: 'none', primary: 'Primary', secondary: 'Secondary', fallback: 'Fallback', add_fallback: 'Add a fallback exit node', remove: 'Remove', fallback_hint: 'Fallbacks are tried in this order after the secondary.',
 		'p.egress': 'Internet through this node works (verified)', 'p.egress-fail': 'node answers, but no Internet through it',
 		'p.reach': 'reachable (ping only, Internet not tested)', 'p.unreachable': 'not reachable', 'p.rejected': 'rejected (not approved or wrong identity)',
 		'p.pending': 'being applied', 'p.unknown': 'no data yet',
@@ -69,7 +69,7 @@ var TEXTS = {
 		'r.leak': 'LEAK-RISIKO: der Schutz ist nicht vollst\u00e4ndig installiert. Diagnose pr\u00fcfen.',
 		'r.inconsistent': 'Der Firewall-Guard ist in einem inkonsistenten Zustand.',
 		'r.node_mismatch': 'Tailscale meldet einen anderen Exit-Node als der Controller erwartet',
-		active_exit: 'Aktiver Exit-Node', none: 'keiner', primary: 'Prim\u00e4r', secondary: 'Sekund\u00e4r',
+		active_exit: 'Aktiver Exit-Node', none: 'keiner', primary: 'Prim\u00e4r', secondary: 'Sekund\u00e4r', fallback: 'Ausweich-Node', add_fallback: 'Ausweich-Exit-Node hinzuf\u00fcgen', remove: 'Entfernen', fallback_hint: 'Ausweich-Nodes werden nach dem Sekund\u00e4ren in dieser Reihenfolge versucht.',
 		'p.egress': 'Internet \u00fcber diesen Node funktioniert (nachgewiesen)', 'p.egress-fail': 'Node antwortet, aber kein Internet dar\u00fcber',
 		'p.reach': 'erreichbar (nur Ping, Internet nicht getestet)', 'p.unreachable': 'nicht erreichbar', 'p.rejected': 'abgelehnt (nicht freigegeben oder falsche Identit\u00e4t)',
 		'p.pending': 'wird gerade gesetzt', 'p.unknown': 'noch keine Daten',
@@ -383,7 +383,7 @@ return {
 				self.nodes = (r[1].result && r[1].result.nodes) || [];
 				self.nets = (r[2].result && r[2].result.subnets) || [];
 				var on = self.nets.filter(function(n) { return n.allowed; }).map(function(n) { return n.cidr; });
-				self.sel = { primary: self.config.primary || '', secondary: self.config.secondary || '', failover: self.config.failover !== 'off', auto_return: !!self.config.auto_return, mode_label: self.config.mode_label || '', hw_at_boot: self.config.hw_at_boot || 'last', nets: on };
+				self.sel = { primary: self.config.primary || '', secondary: self.config.secondary || '', fallbacks: ((self.config.nodes || []).slice(2).map(function(n) { return n.ip; })), failover: self.config.failover !== 'off', auto_return: !!self.config.auto_return, mode_label: self.config.mode_label || '', hw_at_boot: self.config.hw_at_boot || 'last', nets: on };
 			}).catch(function() {}).then(function() { return self.refresh(); });
 		},
 		toggleNet: function(n) {
@@ -430,7 +430,9 @@ return {
 		save: function() {
 			var self = this, s = self.sel;
 			function nm(ip) { var o = Logic.nodeOptions(self.nodes, self.config).filter(function(x) { return x.ip === ip; })[0]; return o && o.name !== ip ? o.name : ''; }
-			return self.act(self.call('config_set', { primary: s.primary, primary_name: nm(s.primary), secondary: s.secondary, secondary_name: nm(s.secondary), auto_return: !!s.auto_return, mode_label: String(s.mode_label || '').trim(), hw_at_boot: s.hw_at_boot === 'switch' ? 'switch' : 'last', allow_subnets4: (s.nets || []).join(' ') })
+			var fb = (s.fallbacks || []).filter(function(ip, i, a) { return ip && ip !== s.primary && ip !== s.secondary && a.indexOf(ip) === i; });
+			var listed = (fb.length || ((self.config.nodes || []).length > 2)) ? (function() { var ips = [ s.primary ].concat(s.secondary ? [ s.secondary ] : []).concat(fb); return { nodes: ips.join(' '), node_names: ips.map(function(ip) { return nm(ip) || '-'; }).join(' ') }; })() : { primary: s.primary, primary_name: nm(s.primary), secondary: s.secondary, secondary_name: nm(s.secondary) };
+			return self.act(self.call('config_set', Object.assign(listed, { auto_return: !!s.auto_return, mode_label: String(s.mode_label || '').trim(), hw_at_boot: s.hw_at_boot === 'switch' ? 'switch' : 'last', allow_subnets4: (s.nets || []).join(' ') }))
 				.then(function(r) { return r.ok === false ? r : self.call('set_failover', { mode: s.failover ? 'auto' : 'off', source: 'gui' }).then(function(r2) { return r2.ok === false ? r2 : r; }); })).then(function() { return self.loadAll(); });
 		},
 		loadDiag: function() { var self = this; return self.call('diag').then(function(r) { self.diag = (r.diag || []).join('\n'); }).catch(function(e) { self.diag = String(e.message || e); }); },
@@ -494,6 +496,18 @@ return {
 			var o = opts.map(function(x) { return h('option', { attrs: { value: x.ip, selected: x.ip === self.sel[key] ? 'selected' : null } }, x.name + ' (' + x.ip + ')'); });
 			if (allowNone) o.unshift(h('option', { attrs: { value: '' } }, '- ' + T('none', l) + ' -'));
 			return h('select', { class: 'tsem-select', attrs: { id: id }, domProps: { value: self.sel[key] }, on: { change: function(e) { self.sel[key] = e.target.value; } } }, o);
+		}
+		function fallbackRows() {
+			var fbs = self.sel.fallbacks || [], max = (self.config && self.config.max_nodes) || 8;
+			var rows = fbs.map(function(ip, i) {
+				var o = opts.map(function(x) { return h('option', { attrs: { value: x.ip, selected: x.ip === ip ? 'selected' : null } }, x.name + ' (' + x.ip + ')'); });
+				o.unshift(h('option', { attrs: { value: '' } }, '- ' + T('none', l) + ' -'));
+				var sel = h('select', { class: 'tsem-select', attrs: { id: 'tsem-fallback-' + i }, domProps: { value: ip }, on: { change: function(e) { var a = self.sel.fallbacks.slice(); a[i] = e.target.value; self.sel.fallbacks = a; } } }, o);
+				var rm = h('button', { class: 'tsem-btn tsem-ghost', attrs: { type: 'button', id: 'tsem-fallback-rm-' + i }, on: { click: function() { self.sel.fallbacks = self.sel.fallbacks.filter(function(x, j) { return j !== i; }); } } }, T('remove', l));
+				return row(T('fallback', l) + ' ' + (i + 1), el('div', 'tsem-actions', [ sel, rm ]));
+			});
+			var add = fbs.length + 2 < max ? h('button', { class: 'tsem-btn tsem-ghost', attrs: { type: 'button', id: 'tsem-fallback-add' }, on: { click: function() { self.sel.fallbacks = (self.sel.fallbacks || []).concat(['']); } } }, T('add_fallback', l)) : null;
+			return el('div', '', rows.concat([ add, fbs.length ? el('div', 'tsem-hint', T('fallback_hint', l)) : null ]));
 		}
 		var kids = [ h('style', {}, CSS) ];
 
@@ -610,7 +624,8 @@ return {
 		]));
 
 		if (has) {
-			var cap = [ [ T('primary', l), st.primary, st.primary_probe ], [ T('secondary', l), (st.secondary && st.secondary !== 'none') ? st.secondary : '', st.secondary_probe ] ];
+			var cap = (st.node_list && st.node_list.length) ? st.node_list.map(function(n) { return [ n.rank === 1 ? T('primary', l) : n.rank === 2 ? T('secondary', l) : T('fallback', l) + ' ' + (n.rank - 2), n.ip, n.probe ]; }) : [ [ T('primary', l), st.primary, st.primary_probe ], [ T('secondary', l), (st.secondary && st.secondary !== 'none') ? st.secondary : '', st.secondary_probe ] ];
+			if (cap.length < 2) cap.push([ T('secondary', l), '', '' ]);
 			kids.push(el('div', 'tsem-grid', [
 				card(T('exit_nodes', l), cap.map(function(c) {
 					return c[1] ? el('div', 'tsem-node', [ el('div', 'tsem-node-role', c[0]), el('div', 'tsem-node-name', nodeName(c[1])), el('div', 'tsem-ip', c[1]), chip(probeKind(c[2]), Logic.probeText(c[2], l)) ])
@@ -632,6 +647,7 @@ return {
 		kids.push(card(T('settings', l), [
 			row(T('primary', l), picker('tsem-primary', 'primary', false)),
 			row(T('secondary', l), picker('tsem-secondary', 'secondary', true)),
+				fallbackRows(),
 			row(T('failover_policy', l), sw('tsem-failover', 'failover')),
 			row(T('auto_return', l), sw('tsem-autoreturn', 'auto_return')),
 			row(T('hw_at_boot', l), h('select', { class: 'tsem-select', attrs: { id: 'tsem-hwboot' }, domProps: { value: self.sel.hw_at_boot }, on: { change: function(e) { self.sel.hw_at_boot = e.target.value; } } }, [

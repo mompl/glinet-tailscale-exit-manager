@@ -7,6 +7,7 @@
 # Options
 #   --primary NAME|IP       exit node that is preferred (a Tailscale peer name or its 100.x address)
 #   --secondary NAME|IP     exit node used when the primary fails (optional)
+#   --fallback NAME|IP      further exit node, tried in the order given after the secondary (repeatable, up to 6)
 #   --allow-subnets "A B"   IPv4 subnets behind your nodes that stay reachable while protected (optional)
 #   --exit                  after the setup, switch to the exit-node mode (automatically back to DIRECT if it does not come up); --german is an alias
 #   --mode-label NAME       the name shown in the GUI, Home Assistant and messages for that mode (default: EXIT), e.g. "Germany" or "Office VPN"
@@ -17,6 +18,8 @@
 #   --adopt-exit-node       the router already uses an exit node (GL.iNet's Tailscale page): take it over as the primary and go
 #                           straight to the exit-node mode (never through DIRECT); the GL.iNet setting is given back by uninstall.sh
 #   --ignore-existing-exit-node   install anyway: the existing exit node is cleared when tsem starts in DIRECT (traffic leaves directly)
+#   --admin-subnet NET      keep the router reachable over this private network of a WAN-side link (for example the Wi-Fi uplink of a
+#                           GL-E5800: 10.50.0.0/24) while protected; repeatable (TSEM_ADMIN_SUBNETS4)
 #   --report FILE           where to write the report (default /etc/tsem/last-setup-report.txt)
 #   --yes                   never ask; every choice comes from the options
 #   --root DIR              install into DIR (tests)
@@ -31,13 +34,15 @@
 set -u
 umask 022
 HERE=$(cd "$(dirname "$0")" && pwd)
-ROOT=/ YES=0 PRIMARY='' SECONDARY='' SUBNETS='' GERMAN=0 MODE_LABEL='' ACTIVATE=1 KEEP=0 REPORT='' INST_ARGS='' HAVE_SUBNETS=0 DEPS=1 RMRULE=0 ADOPT=''
+ROOT=/ YES=0 PRIMARY='' SECONDARY='' SUBNETS='' GERMAN=0 MODE_LABEL='' ACTIVATE=1 KEEP=0 REPORT='' INST_ARGS='' HAVE_SUBNETS=0 DEPS=1 RMRULE=0 ADOPT='' ADMIN='' FALLBACKS=''
 while [ $# -gt 0 ]; do
 	case $1 in
 	--yes) YES=1; shift ;;
 	--primary) [ $# -ge 2 ] || { echo "--primary needs a value" >&2; exit 2; }; PRIMARY=$2; shift 2 ;;
 	--secondary) [ $# -ge 2 ] || { echo "--secondary needs a value" >&2; exit 2; }; SECONDARY=$2; shift 2 ;;
 	--allow-subnets) [ $# -ge 2 ] || { echo "--allow-subnets needs a value" >&2; exit 2; }; SUBNETS=$2; HAVE_SUBNETS=1; shift 2 ;;
+	--fallback) [ $# -ge 2 ] || { echo "--fallback needs a value" >&2; exit 2; }; FALLBACKS="${FALLBACKS:+$FALLBACKS }$2"; shift 2 ;;
+	--admin-subnet) [ $# -ge 2 ] || { echo "--admin-subnet needs a value" >&2; exit 2; }; ADMIN="${ADMIN:+$ADMIN }$2"; shift 2 ;;
 	--exit | --german) GERMAN=1; shift ;;
 	--mode-label) [ $# -ge 2 ] || { echo "--mode-label needs a value" >&2; exit 2; }; MODE_LABEL=$2; shift 2 ;;
 	--no-activate) ACTIVATE=0; shift ;;
@@ -50,13 +55,14 @@ while [ $# -gt 0 ]; do
 		--ignore-existing-exit-node) ADOPT=0; shift ;;
 	--report) [ $# -ge 2 ] || { echo "--report needs a value" >&2; exit 2; }; REPORT=$2; shift 2 ;;
 	--root) [ $# -ge 2 ] || { echo "--root needs a value" >&2; exit 2; }; ROOT=$2; shift 2 ;;
-	-h | --help) sed -n '2,30p' "$0"; exit 0 ;;
+	-h | --help) sed -n '2,34p' "$0"; exit 0 ;;
 	*) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
 	esac
 done
 case $MODE_LABEL in *[!A-Za-z0-9' '_-]*) echo "--mode-label: letters, digits, space, - and _ only (max 20)" >&2; exit 2 ;; esac
 [ ${#MODE_LABEL} -le 20 ] || { echo "--mode-label: at most 20 characters" >&2; exit 2; }
 case $SUBNETS in *[!0-9./\ ]*) echo "--allow-subnets: only IPv4 subnets like '10.0.0.0/24 10.0.1.0/24'" >&2; exit 2 ;; esac
+case $ADMIN in *[!0-9./\ ]*) echo "--admin-subnet: only IPv4 networks like 10.50.0.0/24" >&2; exit 2 ;; esac
 [ "$GERMAN" -eq 0 ] || [ "$ACTIVATE" -eq 1 ] || { echo "--german needs the activation (do not combine with --no-activate)" >&2; exit 2; }
 
 R=${ROOT%/}
@@ -113,7 +119,7 @@ finish() {
    * Mode after a reboot: the intent is stored; the kill switch is installed before the network comes up.
    * Undo everything: sh uninstall.sh --yes      Undo only this installation: sh install.sh --rollback --yes
 EOF
-		[ "$GERMAN" -eq 1 ] || [ "$ACTIVATE" -eq 0 ] || echo " * The router is in DIRECT mode (nothing is rerouted yet). Switch to the exit-node mode in the GUI or with: tsem set exit" | tee -a "$LOG"
+		[ "$GERMAN" -eq 1 ] || [ "$ACTIVATE" -eq 0 ] || [ -n "${KEEP:-}" ] || echo " * The router is in DIRECT mode (nothing is rerouted yet). Switch to the exit-node mode in the GUI or with: tsem set exit" | tee -a "$LOG"
 	else
 		cat <<EOF | tee -a "$LOG"
 
@@ -339,6 +345,17 @@ else
 		fi
 		# shellcheck disable=SC2086
 		if _o=$("$TSEM" config set $_set 2>&1); then ok "primary ${_pr%%|*}${SECONDARY:+, secondary ${_sr%%|*}} saved"; else fail "could not save the exit nodes: $_o"; undo_install; finish; fi
+		if [ -n "$FALLBACKS" ]; then
+			_nl="${_pr%%|*}${SECONDARY:+ ${_sr%%|*}}" _nn="${_pr#*|}"; _nn="${_nn:--}"
+			[ -z "$SECONDARY" ] || { _x="${_sr#*|}"; _nn="$_nn ${_x:--}"; }
+			for _fb in $FALLBACKS; do
+				_fr=$(resolve_node "$_fb")
+				case $_fb in *[!0-9.]*) [ -n "$_fr" ] || { fail "'$_fb' is not a peer of this tailnet"; undo_install; finish; } ;; esac
+				[ -n "$_fr" ] || _fr="$_fb|"
+				_x="${_fr#*|}"; _nl="$_nl ${_fr%%|*}"; _nn="$_nn ${_x:--}"
+			done
+			if _o=$("$TSEM" config set "TSEM_NODES=$_nl" "TSEM_NODE_NAMES=$_nn" 2>&1); then ok "exit nodes in order: $_nl"; else fail "could not save the exit node list: $_o"; undo_install; finish; fi
+		fi
 	fi
 fi
 if [ "$HAVE_SUBNETS" -eq 1 ]; then
@@ -352,6 +369,9 @@ conf_put() { # KEY VALUE (quoted)
 	_t=$WORK/conf.put
 	{ [ -f "$CONF" ] && cat "$CONF"; true; } | awk -v k="$1" -v v="$2" 'BEGIN{d=0} index($0,k "=")==1 && !d {print k "=\"" v "\""; d=1; next} {print} END{if(!d) print k "=\"" v "\""}' >"$_t" && cp "$_t" "$CONF"
 }
+if [ -n "$ADMIN" ]; then
+	if conf_put TSEM_ADMIN_SUBNETS4 "$ADMIN"; then ok "the router stays reachable over: $ADMIN"; else fail "could not save the admin networks"; fi
+fi
 if [ -z "$MODE_LABEL" ] && interactive; then MODE_LABEL=$(ask "      Name for the exit-node mode shown in the GUI (e.g. Germany, Office VPN)" EXIT); fi
 if [ -n "$MODE_LABEL" ] && [ "$MODE_LABEL" != "$(conf_get TSEM_MODE_LABEL)" ]; then
 	if conf_put TSEM_MODE_LABEL "$MODE_LABEL"; then ok "the exit-node mode is called: $MODE_LABEL"; else fail "could not save the mode name"; fi
@@ -406,10 +426,27 @@ else
 	if [ "$ADOPT" = 1 ]; then "$TSEM" set german --no-wait >>"$LOG" 2>&1 || true; fi
 	# a running service keeps the OLD code in memory: after an update it must be restarted (stopping does not open the kill switch)
 	_cmd=start
+	# an update of a router that is protected right now keeps its mode: DIRECT is never passed through (kill switch stays on)
+	KEEP=''
+	if [ "$ADOPT" != 1 ] && "$INITD" running >/dev/null 2>&1; then
+		case $(st mode) in german) KEEP=german ;; blocked) KEEP=blocked ;; esac
+	fi
 	if "$INITD" running >/dev/null 2>&1; then _cmd=restart; info "tsem was already running: restarting it so that the new version is used"; fi
 	if "$INITD" "$_cmd" >>"$LOG" 2>&1; then STARTED=1; else fail "the service did not start"; fi
 	if [ "$STARTED" -eq 1 ] && [ "$ADOPT" = 1 ]; then
 		ok "service started; the exit-node mode follows next (the router already used an exit node, DIRECT is skipped)"
+	elif [ "$STARTED" -eq 1 ] && [ -n "$KEEP" ]; then
+		_i=0
+		while [ "$_i" -lt "${SETUP_GERMAN_WAIT:-90}" ]; do
+			[ "$KEEP" = blocked ] && break
+			case $(st state) in PRIMARY_ACTIVE | SECONDARY_ACTIVE) break ;; esac
+			_i=$((_i + 3)); sleep 3
+		done
+		if [ "$(st mode)" = "$KEEP" ] && [ "$(st guard)" != open ]; then
+			ok "updated; the router stayed protected (mode $KEEP, state $(st state)); it was not switched to DIRECT"
+		else
+			fail "after the restart the mode is $(st mode) / guard $(st guard) instead of $KEEP"
+		fi
 	elif [ "$STARTED" -eq 1 ]; then
 		"$TSEM" set direct --no-wait >>"$LOG" 2>&1 || true
 		_i=0
@@ -425,7 +462,9 @@ else
 			fail "the service did not reach DIRECT mode (mode=$(st mode), guard=$(st guard))"
 		fi
 	fi
-	if [ "$FAILED" -ne 0 ]; then
+	if [ "$FAILED" -ne 0 ] && [ -n "$KEEP" ]; then
+		say "      the router was protected before the update and stays so (no switch to DIRECT); check: tsem status"
+	elif [ "$FAILED" -ne 0 ]; then
 		say "      putting the router back to DIRECT and stopping the service ..."
 		"$TSEM" set direct --no-wait >>"$LOG" 2>&1 || true
 		"$INITD" stop >>"$LOG" 2>&1 || true

@@ -1,7 +1,7 @@
 {
   "domain": "tsem",
   "name": "GL.iNet Tailscale Exit Manager",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "documentation": "https://github.com/mompl/glinet-tailscale-exit-manager/blob/main/homeassistant/README.md",
   "issue_tracker": "https://github.com/mompl/glinet-tailscale-exit-manager/issues",
   "codeowners": [],

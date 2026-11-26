@@ -152,7 +152,7 @@ test_blocked_releases_exactly_the_configured_private_subnets() {
 		assert_contains "rule $n" "-i br-lan -o tailscale0 -d $n -j RETURN" "$(printf '%s\n' "$_r" | sed 's/ -d \([^ ]*\) -i br-lan -o tailscale0/ -i br-lan -o tailscale0 -d \1/')"
 	done
 	assert_contains tailnet "100.64.0.0/10" "$_r"
-	case $_r in *10.0.0.0/8*|*172.16.0.0/12*|*192.168.0.0/16*|*10.77.*|*0.0.0.0/0*) fail "no blanket RFC1918 / unlisted network may be released" ;; esac
+	case $_r in *10.0.0.0/8*|*172.16.0.0/12*|*192.168.0.0/16*|*10.20.*|*0.0.0.0/0*) fail "no blanket RFC1918 / unlisted network may be released" ;; esac
 	# the REJECT stays the last rule of the LAN iface
 	assert_contains last '-j REJECT' "$(printf '%s\n' "$_r" | grep -v '^COMMIT' | tail -1)"
 	# no conntrack shortcut, no ACCEPT
@@ -182,6 +182,27 @@ test_shipped_config_is_neutral_and_releases_no_private_range_by_default() {
 test_invalid_allow_subnet_is_rejected_not_released() {
 	printf 'TSEM_ALLOW_SUBNETS4="10.30.0.0/24 10.0.0.0/8;reboot"\n' >"$T/bad.conf"
 	_r=$(_rules_conf "$T/bad.conf" 4 blocked 2>/dev/null) || true
+	case $_r in *reboot*|*10.0.0.0/8*) fail "invalid entry must never reach the rules" ;; esac
+}
+
+test_admin_subnets_release_router_own_traffic_to_exactly_those_networks() {
+	printf 'TSEM_ADMIN_SUBNETS4="10.50.0.0/24 192.168.9.0/28"
+' >"$T/adm.conf"
+	_r=$( ( TSEM_CONF=$T/adm.conf; export TSEM_CONF; . "$TSEM_LIBDIR/common.sh"; . "$TSEM_LIBDIR/conf.sh"; conf_load; . "$TSEM_LIBDIR/backend_ipt.sh"; _g_out_rules 4 german ) )
+	assert_contains a "-A TSEM_OUT -d 10.50.0.0/24 -j RETURN" "$_r"
+	assert_contains b "-A TSEM_OUT -d 192.168.9.0/28 -j RETURN" "$_r"
+	# before the final REJECT, and no blanket network
+	 assert_contains last "-j REJECT" "$(printf '%s
+' "$_r" | grep -v '^COMMIT' | tail -1)"
+	case $_r in *10.0.0.0/8*|*0.0.0.0/0*) fail "no blanket network may be released" ;; esac
+	# default: nothing
+	: >"$T/none.conf"
+	_r=$( ( TSEM_CONF=$T/none.conf; export TSEM_CONF; . "$TSEM_LIBDIR/common.sh"; . "$TSEM_LIBDIR/conf.sh"; conf_load; . "$TSEM_LIBDIR/backend_ipt.sh"; _g_out_rules 4 german ) )
+	case $_r in *" -d "*) fail "no destination exception by default" ;; esac
+	# invalid entries are rejected
+	printf 'TSEM_ADMIN_SUBNETS4="10.50.0.0/24 10.0.0.0/8;reboot"
+' >"$T/admbad.conf"
+	_r=$( ( TSEM_CONF=$T/admbad.conf; export TSEM_CONF; . "$TSEM_LIBDIR/common.sh"; . "$TSEM_LIBDIR/conf.sh"; conf_load; . "$TSEM_LIBDIR/backend_ipt.sh"; _g_out_rules 4 german ) 2>/dev/null) || true
 	case $_r in *reboot*|*10.0.0.0/8*) fail "invalid entry must never reach the rules" ;; esac
 }
 

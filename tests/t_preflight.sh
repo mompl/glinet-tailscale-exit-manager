@@ -253,12 +253,12 @@ test_empty_table52_fails_all_extnet_routes() {
 	want FAIL route.extnet0; want FAIL route.extnet1; want FAIL route.extnet2; want WARN pr.table52; rcis 1
 }
 test_further_private_routes_are_listed_as_warning_only() {
-	pf_fixture; printf '10.77.5.0/24 dev tailscale0 \n192.168.50.0/24 dev tailscale0 \n' >>"$PFX/ip.t52"; pf_run
-	want WARN masq.private; assert_contains list "10.77.5.0/24 192.168.50.0/24" "$PFOUT"; rcis 0; rec READY_FOR_PASSIVE_INSTALL
+	pf_fixture; printf '10.20.5.0/24 dev tailscale0 \n192.168.50.0/24 dev tailscale0 \n' >>"$PFX/ip.t52"; pf_run
+	want WARN masq.private; assert_contains list "10.20.5.0/24 192.168.50.0/24" "$PFOUT"; rcis 0; rec READY_FOR_PASSIVE_INSTALL
 }
 test_private_route_covered_by_allow_list_is_pass() {
-	pf_fixture; printf '10.77.5.0/24 dev tailscale0 \n' >>"$PFX/ip.t52"
-	mkdir -p "$RT/etc/tsem"; printf 'TSEM_ALLOW_SUBNETS4="10.30.0.0/24 10.30.1.0/24 10.30.2.0/24 10.77.5.0/24"\n' >"$RT/etc/tsem/tsem.conf"; pf_run
+	pf_fixture; printf '10.20.5.0/24 dev tailscale0 \n' >>"$PFX/ip.t52"
+	mkdir -p "$RT/etc/tsem"; printf 'TSEM_ALLOW_SUBNETS4="10.30.0.0/24 10.30.1.0/24 10.30.2.0/24 10.20.5.0/24"\n' >"$RT/etc/tsem/tsem.conf"; pf_run
 	want PASS masq.private; want PASS conf.allow
 }
 

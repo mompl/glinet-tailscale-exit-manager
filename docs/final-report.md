@@ -4,6 +4,21 @@
 
 Zusammenfassung (Deutsch): Alle Anforderungen, die ohne den Router umsetzbar und beweisbar sind, sind umgesetzt und mit echten Netzwerk-Tests belegt (Kernel-Netfilter in Namespaces, IPv4 und erstmals IPv6). Fehler F01 bis F07 sind behoben (F06 war kein Defekt, sondern eine unsichtbare Hysterese, jetzt sichtbar gemacht). F08 ist durch eine ehrliche Matrix geschlossen: Was nur der Router zeigen kann, steht als Abnahmeschritt da. Die Definition of Done ist erst nach dem Hardwarelauf erfüllt.
 
+## 0000. v1.1 work in progress (branch `feat/v1.1`, not released)
+
+Automated suite on this branch (dash and bash, each 574 passed / 0 failed after the last fix; netns IPv4 59/0, IPv6 7/0; the exact CI
+ShellCheck command clean). **Not yet run on real hardware** (the GL-MG1300 was not reachable when this was written): treat v1.1 as untested on routers
+until the regression below has been repeated.
+
+| Feature | State |
+|---|---|
+| Management over a WAN-side private network while protected (`TSEM_ADMIN_SUBNETS4`, `setup.sh --admin-subnet`) | tested with generated rules; the routing side relies on Tailscale's LAN-access rules (as on the GL-E5800) |
+| `tsem-notify` (ntfy / webhook on failover, BLOCKED, recovery; queued while the kill switch is closed) | tested with a `curl` stand-in; **no real message was sent** |
+| `tsem backup` / `tsem restore` (settings only) | tested, hostile archives refused |
+| Ordered exit node list, up to 8 (`TSEM_NODES`), failover walks the ranks, auto-return to the best healthy rank, `setup.sh --fallback`, GUI/LuCI/HA show all nodes | tested with 2 and 3 nodes in the mock suite; the older two-key config and an older running failover state still load. **Hardware regression to repeat:** EXIT, failover (also with an unreachable node in the middle of the list), auto-return, BLOCKED, DIRECT, reboot |
+
+CI note: the GitHub unit job runs the suites as root (one test requires it) and test stubs must carry the executable bit in git.
+
 ## 000. Update 2026-11-24 (evening): release `ddc9096`, three routers on real hardware
 
 Code commit `ddc9096` (release `tsem-1.0.0-ddc9096`, reproducible). Full automated run on exactly this tree: dash 552/0, bash 552/0, netns IPv4 59/0, IPv6 7/0, shellcheck clean. Exit nodes are shown and saved under their tailnet name (the name Tailscale shows), the machine's hostname is accepted as a second name.

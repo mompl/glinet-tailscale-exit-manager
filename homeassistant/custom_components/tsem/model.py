@@ -53,6 +53,12 @@ def derive(st: dict) -> dict:
         "secondary": st.get("secondary"),
         "secondary_name": st.get("secondary_name") if st.get("secondary_name") not in ("", "none") else None,
         "secondary_probe": st.get("secondary_probe"),
+        # the ordered list of exit nodes (older controllers only know primary and secondary: the list is then empty)
+        "active_rank": st.get("active_rank") if isinstance(st.get("active_rank"), int) else None,
+        "node_list": [
+            {"rank": n.get("rank"), "ip": n.get("ip"), "name": n.get("name") or None, "ok": n.get("ok"), "probe": n.get("probe")}
+            for n in (st.get("node_list") or []) if isinstance(n, dict)
+        ],
         "hw_state": st.get("hw_state"),
         "hw_match": st.get("hw_match"),
         "ipv6_protection": st.get("ipv6_protection"),

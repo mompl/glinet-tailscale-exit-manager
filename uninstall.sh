@@ -75,6 +75,7 @@ if [ -f "$SUF" ] && grep -qF "$KEEP_B" "$SUF"; then
 	say "  removed the tsem keep list from /etc/sysupgrade.conf"
 	grep -q '[^[:space:]]' "$SUF" || rm -f "$SUF" # nothing else in it (we created it)
 fi
+rm -f "$(p /lib/upgrade/keep.d/tsem)"
 # the toggle button setting this setup made (only when it still has our value)
 if [ -e "$CONF_DIR/hw-func-set" ] && command -v "${SETUP_UCI:-uci}" >/dev/null 2>&1; then
 	_u=${SETUP_UCI:-uci}

@@ -449,6 +449,21 @@ upgrade_keep() {
 		ln -s ../init.d/tsem-restore "$(p /etc/rc.d/S17tsem-restore)" || return 1
 		jlog "created|/etc/rc.d/S17tsem-restore"
 	fi
+	# The same list as a firmware keep.d file (the mechanism packages use). Some firmware flows (found on a GL-E5800, 4.10.3 -> 4.10.4: the dropbear
+	# keys of keep.d survived, a user block in /etc/sysupgrade.conf did not) honour only keep.d. Both are written; either one is enough.
+	_kd=$(p /lib/upgrade/keep.d/tsem)
+	_kdwant=$(printf '%s
+%s
+%s
+%s
+' "/etc/tsem/" "/etc/init.d/tsem-restore" "/etc/rc.d/S17tsem-restore" "/lib/upgrade/keep.d/tsem")
+	if [ "$(cat "$_kd" 2>/dev/null)" != "$_kdwant" ]; then
+		mkdir -p "$(dirname "$_kd")" || return 1
+		if [ ! -e "$_kd" ]; then jlog "created|/lib/upgrade/keep.d/tsem"; fi
+		printf '%s
+' "$_kdwant" >"$_kd" || return 1
+		say "  add    /lib/upgrade/keep.d/tsem (firmware keep list, same entries)"
+	fi
 	_sf=$(p /etc/sysupgrade.conf)
 	_want=$(printf '%s\n%s\n%s\n%s\n%s\n' "$KEEP_B" "/etc/tsem/" "/etc/init.d/tsem-restore" "/etc/rc.d/S17tsem-restore" "$KEEP_E")
 	_have=''

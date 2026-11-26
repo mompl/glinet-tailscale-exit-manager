@@ -131,6 +131,10 @@ _g_out_rules() { # family state  (state already passed through _out_want)
 		echo '-A TSEM_OUT -o lo -j RETURN'
 		echo "-A TSEM_OUT -o $TSEM_TS_IFACE -j RETURN"
 		for _l in $TSEM_LAN_IFACES $TSEM_OUT_LOCAL_IFACES; do echo "-A TSEM_OUT -o $_l -j RETURN"; done
+		# v1.1: management of the router over a WAN-side private network (e.g. a Wi-Fi uplink): replies and connections to these
+		# destination networks only (never a default route, never the Internet). Empty by default.
+		if [ "$1" = 4 ]; then _am=$TSEM_ADMIN_SUBNETS4; else _am=$TSEM_ADMIN_SUBNETS6; fi
+		for _s in $_am; do echo "-A TSEM_OUT -d $_s -j RETURN"; done
 		# tailscaled underlay: only its own marked sockets, udp or tcp/80,443, never DNS
 		if [ "$TSEM_ALLOW_UNDERLAY_DNS" != 1 ]; then
 			echo "-A TSEM_OUT -m mark --mark $_om -p udp --dport 53 -j REJECT"

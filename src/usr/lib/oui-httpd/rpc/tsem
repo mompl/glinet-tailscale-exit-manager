@@ -24,7 +24,7 @@ local SPEC = {
 	status = {}, config_get = {}, nodes = {}, subnets = {}, egress = {}, events = {}, diag = {}, failover_now = {},
 	set_mode = { mode = "string", confirm = "boolean" },
 	set_failover = { mode = "string" },
-	config_set = { primary = "string", primary_name = "string", secondary = "string", secondary_name = "string", auto_return = "boolean", mode_label = "string", allow_subnets4 = "string", hw_at_boot = "string" },
+	config_set = { nodes = "string", node_names = "string", primary = "string", primary_name = "string", secondary = "string", secondary_name = "string", auto_return = "boolean", mode_label = "string", allow_subnets4 = "string", hw_at_boot = "string" },
 }
 
 local function fail(code, msg)

@@ -17,7 +17,7 @@
 #   ubus call tsem set_mode      write  {"mode":"german|direct|blocked","source":"gui|ha|api","confirm":true (direct only)}
 #   ubus call tsem set_failover  write  {"mode":"auto|off","source":...}
 #   ubus call tsem failover_now  write  manual failover to the other exit node
-#   ubus call tsem config_set    write  {"primary","primary_name","secondary","secondary_name","auto_return"}
+#   ubus call tsem config_set    write  {"nodes","node_names","primary","primary_name","secondary","secondary_name","auto_return"}
 #
 # Every reply is one JSON object with "ok". On errors: "error" (message) and "code" (see below).
 # Replies to changes carry "requested" and the status read AFTER the change ("status"), so a
@@ -137,7 +137,7 @@ do_failover_now() {
 
 do_config_set() {
 	set --
-	for _k in primary primary_name secondary secondary_name auto_return mode_label allow_subnets4 hw_at_boot; do
+	for _k in nodes node_names primary primary_name secondary secondary_name auto_return mode_label allow_subnets4 hw_at_boot; do
 		# a key that is present (even empty) is a change; jsonfilter prints nothing for absent keys
 		_present=$(jsonfilter -s "$INPUT" -t "@.$_k" 2>/dev/null)
 		[ -n "$_present" ] || continue
@@ -165,7 +165,7 @@ list)
 "set_mode":{"mode":"string","source":"string","confirm":true},
 "set_failover":{"mode":"string","source":"string"},
 "failover_now":{},
-"config_set":{"primary":"string","primary_name":"string","secondary":"string","secondary_name":"string","auto_return":true,"mode_label":"string","allow_subnets4":"string","hw_at_boot":"string"}}
+"config_set":{"nodes":"string","node_names":"string","primary":"string","primary_name":"string","secondary":"string","secondary_name":"string","auto_return":true,"mode_label":"string","allow_subnets4":"string","hw_at_boot":"string"}}
 JSON
 	;;
 call)

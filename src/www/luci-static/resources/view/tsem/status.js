@@ -104,6 +104,9 @@ return view.extend({
 				row(T('active_exit', l), (st.active_exit && st.active_exit !== 'none') ? ((st.active_exit_name && st.active_exit_name !== 'none') ? st.active_exit_name + ' (' + st.active_exit + ')' : st.active_exit) : T('none', l)),
 				row(T('primary', l), (st.primary || '-') + ' - ' + Logic.probeText(st.primary_probe, l)),
 				row(T('secondary', l), (st.secondary && st.secondary !== 'none') ? st.secondary + ' - ' + Logic.probeText(st.secondary_probe, l) : T('none', l)),
+			].concat((st.node_list || []).filter(function(n) { return n.rank > 2; }).map(function(n) {
+				return row(T('fallback', l) + ' ' + (n.rank - 2), n.ip + (n.name ? ' (' + n.name + ')' : '') + ' - ' + Logic.probeText(n.probe, l));
+			}), [
 				row(T('kill_switch', l), st.kill_switch_active ? T('on', l) : T('off', l)),
 				row(T('ipv6', l), T('v6.' + (st.ipv6_protection || 'unverified'), l)),
 				row(T('dns', l), T('dns.' + (st.dns_protection || 'unverified'), l) + (st.dns && st.dns !== 'skip' ? ' (probe: ' + st.dns + ')' : '')),
@@ -112,7 +115,7 @@ return view.extend({
 				row(T('return_wait', l), Logic.returnWaitText(st, l)),
 				row(T('hw', l), Logic.hwText(st, l)),
 				row(T('last_action', l), Logic.lastAction(st, l))
-			];
+			]);
 			if (st.boot_failed === 'yes') rows.push(row(T('boot_failed', l), 'yes', 'cbi-value-error'));
 			if (st.error) rows.push(row(T('error_label', l), st.error, 'cbi-value-error'));
 			kids.push(E('table', { 'class': 'table', 'id': 'tsem-status' }, rows));

@@ -1,0 +1,160 @@
+#!/bin/sh
+# tsem-notify - sends a short message when tsem changes state (ntfy or a generic webhook), without Home Assistant.
+#
+#   tsem-notify tick OLD NEW    called by the controller after a tick: queues an event if the state changed, then sends the queue
+#   tsem-notify test            sends a test message now (prints what happened)
+#   tsem-notify queue           shows what is waiting to be sent
+#
+# It only talks to the notification URL; it never touches firewall rules, routes or tailscale, and the controller never waits for it.
+# While the kill switch is closed the Internet is not reachable, so a BLOCKED message waits in a queue (tmpfs, at most 20 lines) and
+# is sent with its ORIGINAL time as soon as a destination is reachable again. A notification server on your tailnet (tailscale0 stays
+# open) is reachable even in BLOCKED, see docs/rc/notifications.md.
+#
+# Config: /etc/tsem/notify.conf (not installed by default; see notify.conf.example). Values are validated; unsafe ones are ignored.
+
+set -u
+umask 077
+NOTIFY_CONF=${TSEM_NOTIFY_CONF:-/etc/tsem/notify.conf}
+RUN=${TSEM_RUN_DIR:-/var/run/tsem}
+TSEM_BIN=${TSEM_BIN:-/usr/sbin/tsem}
+CURL=${TSEM_CURL:-curl}
+Q=$RUN/notify.queue
+LOCK=$RUN/notify.lock
+
+lg() { printf 'tsem-notify: %s\n' "$*" >&2; command -v logger >/dev/null 2>&1 && [ "${TSEM_SYSLOG:-1}" = 1 ] && logger -t tsem-notify -- "$*"; return 0; }
+
+N_TYPE=ntfy N_URL='' N_URL2='' N_NAME='' N_EVENTS='failover blocked recovered' N_TOKENFILE='' N_PRIO_BLOCKED=urgent
+load_conf() {
+	[ -r "$NOTIFY_CONF" ] || return 1
+	while IFS= read -r l || [ -n "$l" ]; do
+		case $l in '' | '#'* | ' '*) continue ;; esac
+		k=${l%%=*}
+		v=${l#*=}
+		case $v in \"*\") v=${v#\"}; v=${v%\"} ;; esac
+		case $k in
+		NOTIFY_TYPE) case $v in ntfy | webhook) N_TYPE=$v ;; *) lg "bad $k" ;; esac ;;
+		NOTIFY_URL) case $v in http://* | https://*) case $v in *[!A-Za-z0-9./:_?=\&%@+-]*) lg "bad $k" ;; *) N_URL=$v ;; esac ;; *) lg "bad $k" ;; esac ;;
+		NOTIFY_URL_FALLBACK) case $v in http://* | https://*) case $v in *[!A-Za-z0-9./:_?=\&%@+-]*) lg "bad $k" ;; *) N_URL2=$v ;; esac ;; *) lg "bad $k" ;; esac ;;
+		NOTIFY_NAME) case $v in '' | *[!A-Za-z0-9._-]*) lg "bad $k" ;; *) N_NAME=$v ;; esac ;;
+		NOTIFY_EVENTS) case $v in *[!a-z\ ]*) lg "bad $k" ;; *) N_EVENTS=$v ;; esac ;;
+		NOTIFY_TOKEN_FILE) case $v in /*) case $v in *[!A-Za-z0-9./_-]*) lg "bad $k" ;; *) N_TOKENFILE=$v ;; esac ;; *) lg "bad $k" ;; esac ;;
+		*) lg "unknown key $k ignored" ;;
+		esac
+	done <"$NOTIFY_CONF"
+	[ -n "$N_URL" ] || { lg "no valid NOTIFY_URL in $NOTIFY_CONF"; return 1; }
+	[ -n "$N_NAME" ] || N_NAME=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo router)
+	return 0
+}
+
+status_field() { "$TSEM_BIN" status 2>/dev/null | sed -n "s/^$1=//p" | head -n1 | tr -cd 'A-Za-z0-9._ -'; }
+
+# event for a state change: prints event name, or nothing
+event_of() { # old new
+	case $2 in
+	SECONDARY_ACTIVE) echo failover ;;
+	BLOCKED) echo blocked ;;
+	PRIMARY_ACTIVE)
+		case $1 in SECONDARY_ACTIVE | BLOCKED | CONNECTING_SECONDARY | DEGRADED | ERROR) echo recovered ;; *) echo exit ;; esac ;;
+	DISABLED) echo direct ;;
+	ERROR) echo error ;;
+	esac
+}
+
+text_of() { # event
+	_lab=$(status_field mode_label); [ -n "$_lab" ] || _lab=EXIT
+	_an=$(status_field active_exit_name)
+	case $1 in
+	failover) echo "$N_NAME: the backup exit node took over${_an:+ ($_an)}. $_lab keeps working." ;;
+	blocked) echo "$N_NAME: BLOCKED. No usable exit node; the network is cut on purpose (no leak)." ;;
+	recovered) echo "$N_NAME: back on the primary exit node${_an:+ ($_an)}." ;;
+	exit) echo "$N_NAME: $_lab is active${_an:+ via $_an}." ;;
+	direct) echo "$N_NAME: DIRECT. Normal internet, the kill switch is off." ;;
+	error) echo "$N_NAME: the controller reports an ERROR. Check tsem status." ;;
+	test) echo "$N_NAME: test message from tsem-notify." ;;
+	*) echo "$N_NAME: $1" ;;
+	esac
+}
+
+prio_of() { case $1 in blocked | error) echo urgent ;; failover) echo high ;; *) echo default ;; esac; }
+tag_of() { case $1 in blocked) echo rotating_light ;; failover) echo warning ;; recovered | exit) echo white_check_mark ;; direct) echo unlock ;; error) echo x ;; *) echo information_source ;; esac; }
+
+send_one() { # epoch event text -> 0 sent
+	_ts=$1 _ev=$2 _tx=$3
+	command -v "$CURL" >/dev/null 2>&1 || { lg "curl is not installed"; return 1; }
+	_when=$(date -d "@$_ts" '+%H:%M:%S' 2>/dev/null || date -r "$_ts" '+%H:%M:%S' 2>/dev/null || echo "")
+	[ -z "$_when" ] || _tx="$_tx (event time $_when)"
+	_cfg=$RUN/notify.curl
+	: >"$_cfg"
+	if [ -n "$N_TOKENFILE" ] && [ -r "$N_TOKENFILE" ]; then
+		printf 'header = "Authorization: Bearer %s"\n' "$(tr -d '\r\n"' <"$N_TOKENFILE")" >>"$_cfg"
+	fi
+	if [ "$N_TYPE" = ntfy ]; then
+		printf 'header = "Title: tsem %s"\nheader = "Priority: %s"\nheader = "Tags: %s"\n' "$_ev" "$(prio_of "$_ev")" "$(tag_of "$_ev")" >>"$_cfg"
+		_body=$_tx
+	else
+		printf 'header = "Content-Type: application/json"\n' >>"$_cfg"
+		_body=$(printf '{"router":"%s","event":"%s","time":%s,"message":"%s"}' "$N_NAME" "$_ev" "$_ts" "$(printf '%s' "$_tx" | tr -d '"\\')")
+	fi
+	"$CURL" -s -f -m 10 -K "$_cfg" -d "$_body" "$N_URL" >/dev/null 2>&1
+	_rc=$?
+	# the main address (normally the public one) did not work, for example in BLOCKED: try the second one (a server on the tailnet)
+	if [ "$_rc" -ne 0 ] && [ -n "$N_URL2" ]; then
+		"$CURL" -s -f -m 10 -K "$_cfg" -d "$_body" "$N_URL2" >/dev/null 2>&1
+		_rc=$?
+	fi
+	rm -f "$_cfg"
+	return $_rc
+}
+
+flush() {
+	[ -s "$Q" ] || return 0
+	_left=$RUN/notify.left
+	: >"$_left"
+	_stop=0
+	while IFS='|' read -r ts ev tx || [ -n "$ts" ]; do
+		[ -n "$ts" ] || continue
+		if [ "$_stop" = 1 ]; then printf '%s|%s|%s\n' "$ts" "$ev" "$tx" >>"$_left"; continue; fi
+		if send_one "$ts" "$ev" "$tx"; then :; else _stop=1; printf '%s|%s|%s\n' "$ts" "$ev" "$tx" >>"$_left"; fi
+	done <"$Q"
+	tail -n 20 "$_left" >"$Q"
+	rm -f "$_left"
+	[ -s "$Q" ] || rm -f "$Q"
+}
+
+enqueue() { # event
+	case " $N_EVENTS " in *" $1 "*) ;; *) return 0 ;; esac
+	printf '%s|%s|%s\n' "$(date +%s)" "$1" "$(text_of "$1")" >>"$Q"
+}
+
+with_lock() {
+	mkdir -p "$RUN"
+	_i=0
+	while ! mkdir "$LOCK" 2>/dev/null; do
+		_i=$((_i + 1))
+		[ "$_i" -le 30 ] || { [ -n "$(find "$LOCK" -mmin +2 2>/dev/null)" ] && rmdir "$LOCK" 2>/dev/null; return 1; }
+		sleep 1
+	done
+	trap 'rmdir "$LOCK" 2>/dev/null' EXIT INT TERM
+	"$@"
+}
+
+case ${1:-} in
+tick)
+	[ $# -ge 3 ] || exit 2
+	load_conf || exit 0
+	_ev=$(event_of "$2" "$3")
+	run_tick() { [ "$2" = "$3" ] || { [ -z "$_ev" ] || enqueue "$_ev"; }; flush; }
+	with_lock run_tick "$@"
+	;;
+test)
+	load_conf || { echo "tsem-notify: no usable $NOTIFY_CONF"; exit 1; }
+	if send_one "$(date +%s)" test "$(text_of test)"; then echo "tsem-notify: sent to $N_URL"; else echo "tsem-notify: could not send to $N_URL"; exit 1; fi
+	;;
+queue)
+	[ -s "$Q" ] && cat "$Q" || echo "(empty)"
+	;;
+*)
+	echo "usage: tsem-notify tick OLD NEW | test | queue" >&2
+	exit 2
+	;;
+esac

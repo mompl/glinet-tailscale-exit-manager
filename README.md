@@ -38,7 +38,9 @@ on the <a href="https://mompl.github.io/glinet-tailscale-exit-manager/">project 
 Controls: GL.iNet web UI (**APPLICATIONS > Tailscale Exit Manager**), LuCI, the command line (`tsem`), Home Assistant, and the
 physical toggle switch if your router has one (optional).
 
-> **Status (pre-release).** Tested in network namespaces with real kernel netfilter and on real routers: **GL.iNet GL-MT3000** (firmware 4.11.x) and **GL.iNet GL-MG1300** (firmware 4.11.1) fully; **GL-E5800 (Mudi 7)** installed and checked with a simulated client (experimental, no real Wi-Fi client yet). Other GL.iNet/OpenWrt routers may work (the installer checks the device first and
+> **Status (1.1).** Version 1.1 adds an ordered list of up to 8 exit nodes, push messages without Home Assistant (ntfy/webhook), configuration backup/restore and access to the router over a WAN-side admin network (see `CHANGELOG.md`).
+
+> **Hardware status.** Tested in network namespaces with real kernel netfilter and on real routers: **GL.iNet GL-MT3000** (firmware 4.11.x) and **GL.iNet GL-MG1300** (firmware 4.11.1) fully; **GL-E5800 (Mudi 7)** installed and checked with a simulated client (experimental, no real Wi-Fi client yet). Other GL.iNet/OpenWrt routers may work (the installer checks the device first and
 > refuses what it does not recognise) but are untested. See `docs/final-report.md` for exactly what has and has not been tested.
 
 > **Disclaimer: no warranty, use at your own risk.** TSEM changes the firewall and routing rules of your router. It is built to
@@ -76,7 +78,7 @@ an issue.
 It never switches to the protected mode by itself unless you pass `--exit`, and then it returns to DIRECT automatically if the
 exit node does not come up.
 
-Non-interactive: `sh setup.sh --yes --primary my-exit-node --secondary my-backup-node [--exit] [--mode-label "Germany"]`
+Non-interactive: `sh setup.sh --yes --primary my-exit-node --secondary my-backup-node [--fallback third-node ...] [--exit] [--mode-label "Germany"]`
 Options: `sh setup.sh --help`. Without a GL.iNet web UI the LuCI view is installed; without a hardware switch no switch hook is
 installed (modes are set in the GUI, with `tsem set exit|direct`, or from Home Assistant).
 
@@ -105,6 +107,8 @@ tsem set exit         # protected mode (exit node + kill switch)
 tsem set direct       # normal internet
 tsem nodes            # exit nodes of your tailnet
 tsem selftest         # checks the installation
+tsem backup | restore # save / restore the settings (no secrets)
+tsem-notify test      # send a test message (ntfy or webhook, see docs/rc/notifications.md)
 ```
 
 ## Remove
@@ -116,7 +120,7 @@ sh install.sh --rollback --yes    # undo only the last installation
 
 ## More
 
-`docs/final-report.md` (what is tested, what is not), `docs/native-gui.md`, `docs/rc/operations.md`, `docs/rc/dns-ipv6.md`,
+`CHANGELOG.md`, `docs/rc/notifications.md` (messages to phones, own ntfy server), `docs/firmware-upgrade.md`, `docs/final-report.md` (what is tested, what is not), `docs/native-gui.md`, `docs/rc/operations.md`, `docs/rc/dns-ipv6.md`,
 `docs/rc/router-egress.md` (what the kill switch allows and why), `homeassistant/` (integration), `docs/emergency-recovery.md`.
 Run the tests: `sh tests/run.sh` (Linux with iptables; the packet tests need root and network namespaces).
 

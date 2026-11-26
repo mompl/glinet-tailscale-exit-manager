@@ -11,6 +11,7 @@ Whitelisted `KEY=value` lines only; values containing `$ ` `` ` `` `; | & < > ( 
 | TSEM_ALLOW_OUT_IFACES | extra egress ifaces allowed in german mode (default none) |
 | TSEM_FAIL_N / UP_N / RETURN_N | hysteresis thresholds (clamped: RETURN_N ≥ UP_N) |
 | TSEM_BACKOFF_MIN / MAX, TSEM_INTERVAL | retry backoff, fast tick seconds |
+| TSEM_NODES / TSEM_NODE_NAMES | **v1.1:** the exit nodes as an ordered list (up to 8, rank 1 = preferred). `TSEM_NODES="100.64.0.10 100.64.0.11 100.64.0.12"`, `TSEM_NODE_NAMES="a b c"` (`-` = no name). Failover walks down the list; auto-return goes back to the best healthy rank. TSEM_PRIMARY / TSEM_SECONDARY (and their names) are the older form of rank 1 and 2: they are read when TSEM_NODES is empty and are kept equal to rank 1 and 2 when the list is set. `tsem config set TSEM_NODES=... TSEM_NODE_NAMES=...` writes all of them together |
 | TSEM_PRIMARY_NAME / SECONDARY_NAME | Tailscale hostname or MagicDNS label that must own the IP (`[A-Za-z0-9.-]`, ≤63). Empty = identity NOT verified (reported by `tsem verify-nodes`) |
 | TSEM_OUT_GUARD | `on` (default) / `off`: router-own OUTPUT guard |
 | TSEM_OUT_LOCAL_IFACES | extra local interfaces the router may use freely |

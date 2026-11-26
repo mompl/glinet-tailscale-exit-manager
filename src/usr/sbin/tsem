@@ -15,6 +15,7 @@
 #   tsem config get [--json] | set KEY=VALUE...          exit nodes and auto-return (validated, atomic; the only config writer for GUI/API)
 #   tsem egress [--json] [--refresh]                     public address seen from outside (asks myip.wtf, on demand)
 #   tsem nodes [--json]                                  read-only: exit-capable tailnet peers and their role
+#   tsem backup [FILE] | restore FILE                    save / restore the settings (tsem.conf, notify.conf, mqtt.conf; never the mode or secrets)
 #   tsem deps                                            reinstall packages setup installed and a firmware upgrade removed (needs Internet)
 #   tsem interval                                        read-only: the daemon's current polling interval and why
 #   tsem diag | selftest                                 read-only diagnostics
@@ -46,17 +47,19 @@ TSEM_LIBDIR=${TSEM_LIBDIR:-/usr/lib/tsem}
 conf_load
 backend_load
 
-node_of() {
+node_of() { # rank (1..8), or the older words primary|secondary
 	case $1 in
-	primary) echo "$TSEM_PRIMARY" ;;
-	secondary) echo "$TSEM_SECONDARY" ;;
+	primary) node_ip 1 ;;
+	secondary) node_ip 2 ;;
+	[1-8]) node_ip "$1" ;;
 	esac
 }
 
 name_of() {
 	case $1 in
-	primary) echo "$TSEM_PRIMARY_NAME" ;;
-	secondary) echo "$TSEM_SECONDARY_NAME" ;;
+	primary) node_name 1 ;;
+	secondary) node_name 2 ;;
+	[1-8]) node_name "$1" ;;
 	esac
 }
 
@@ -72,7 +75,7 @@ converge() {
 		*)
 			# A user action clears any exit node; periodic reconcile only clears OUR nodes
 			# (never a node the user picked by hand in DIRECT mode).
-			if [ "${CONVERGE_CLEAR_ALL:-0}" != 1 ] && [ "$_ce" != "$TSEM_PRIMARY" ] && [ "$_ce" != "$TSEM_SECONDARY" ]; then
+			if [ "${CONVERGE_CLEAR_ALL:-0}" != 1 ] && [ "$(node_rank "$_ce")" -eq 0 ]; then
 				be_guard_set open
 				return
 			fi
@@ -126,6 +129,7 @@ converge() {
 
 # _note KEY TEXT: log a probe verdict only when it changed since the last round (no log flood at
 # 5 s intervals), so the reason a node was rejected is visible in logread afterwards.
+_rank_label() { case $1 in 1) echo primary ;; 2) echo secondary ;; *) echo "node$1" ;; esac; }
 _note() {
 	mkdir -p "$TSEM_RUN_DIR" 2>/dev/null
 	[ "$(cat "$TSEM_RUN_DIR/note.$1" 2>/dev/null)" = "$2" ] && return 0
@@ -133,40 +137,54 @@ _note() {
 	log "probe $1: $2"
 }
 
-# PR_KP/PR_KS say WHAT the ok/fail of a node rests on (they are different evidence):
+# PR_K_<rank> say WHAT the ok/fail of a node rests on (they are different evidence):
 #   egress       real Internet fetch through the selected exit node worked
 #   egress-fail  the selected exit node is applied but the fetch failed
 #   reach        not selected: it only answers tailscale ping (this is NOT egress)
 #   unreachable  not selected and does not answer
 #   rejected     identity / online / exit-node approval does not match the configuration
 #   pending      selected but the exit node is not applied (yet): no signal
-_probe_round() { # needs _pr_cur; sets SIG_P SIG_S PR_KP PR_KS PR_DNS
-	SIG_P=0 SIG_S=0 PR_DNS=skip PR_KP=unknown PR_KS=unknown
+_probe_round() { # needs _pr_cur (a rank or none); sets SIG_<rank> PR_K_<rank> PR_DNS
+	PR_DNS=skip
+	_pn=1
+	while [ "$_pn" -le "$TSEM_MAX_NODES" ]; do eval "SIG_$_pn=0 PR_K_$_pn=unknown"; _pn=$((_pn + 1)); done
 	# One `tailscale status` per round identifies the nodes. A node whose name/IP/exit-node
 	# approval does not match the configuration is NEVER usable (no automatic fallback to
 	# "whatever is at that IP"), even if it answers.
-	if [ -n "$TSEM_PRIMARY_NAME$TSEM_SECONDARY_NAME" ]; then be_nodes_scan >/dev/null 2>&1 || true; fi
-	for _pn in primary secondary; do
+	case $TSEM_NODE_NAMES in *[A-Za-z0-9]*) be_nodes_scan >/dev/null 2>&1 || true ;; esac
+	_pn=1
+	while [ "$_pn" -le "${TSEM_NODE_COUNT:-0}" ]; do
 		_pip=$(node_of "$_pn")
+		_pnm=$(name_of "$_pn")
 		_ps=0 _pk=unknown
-		if [ -n "$_pip" ] && ! be_node_check "$(name_of "$_pn")" "$_pip"; then
+		if [ -n "$_pip" ] && ! be_node_check "$_pnm" "$_pip"; then
 			_ps=0 _pk=rejected
-			_note "$_pn" "rejected: $(be_node_why "$(name_of "$_pn")" "$_pip" 2>/dev/null)"
+			_note "$(_rank_label "$_pn")" "rejected: $(be_node_why "$_pnm" "$_pip" 2>/dev/null)"
 		elif [ -n "$_pip" ]; then
 			if [ "$_pn" = "$_pr_cur" ]; then
-				if [ "$(be_exit_get)" != "$_pip" ]; then _ps=2 _pk=pending; _note "$_pn" "exit node not applied yet" # no signal
-				elif be_probe_egress; then _ps=1 _pk=egress; _note "$_pn" "egress ok ($(be_probe_detail))"
-				else _pk=egress-fail; _note "$_pn" "egress FAILED through exit node $_pip: $(be_probe_detail)"; fi
+				if [ "$(be_exit_get)" != "$_pip" ]; then _ps=2 _pk=pending; _note "$(_rank_label "$_pn")" "exit node not applied yet" # no signal
+				elif be_probe_egress; then _ps=1 _pk=egress; _note "$(_rank_label "$_pn")" "egress ok ($(be_probe_detail))"
+				else _pk=egress-fail; _note "$(_rank_label "$_pn")" "egress FAILED through exit node $_pip: $(be_probe_detail)"; fi
 			else
-				if be_probe_reach "$_pip"; then _ps=1 _pk=reach; _note "$_pn" "reachable, not selected (tailscale ping only, no egress proof)"
-				else _pk=unreachable; _note "$_pn" "not reachable (tailscale ping failed 3x)"; fi
+				if be_probe_reach "$_pip"; then _ps=1 _pk=reach; _note "$(_rank_label "$_pn")" "reachable, not selected (tailscale ping only, no egress proof)"
+				else _pk=unreachable; _note "$(_rank_label "$_pn")" "not reachable (tailscale ping failed 3x)"; fi
 			fi
 		fi
-		if [ "$_pn" = primary ]; then SIG_P=$_ps PR_KP=$_pk; else SIG_S=$_ps PR_KS=$_pk; fi
+		eval "SIG_$_pn=\$_ps PR_K_$_pn=\$_pk"
+		_pn=$((_pn + 1))
 	done
 	if [ "$_pr_cur" != none ] && [ -n "$TSEM_DNS_PROBE_HOST" ]; then
 		if be_probe_dns; then PR_DNS=ok; else PR_DNS=fail; fi
 	fi
+}
+
+# v1.1: optional message (ntfy/webhook), called AFTER the change is applied so that the text knows the active exit node. Detached: the
+# controller never waits for it. Without a config file nothing is started.
+_notify_change() { # old new
+	if [ -r "${TSEM_NOTIFY_CONF:-/etc/tsem/notify.conf}" ] && [ -x "${TSEM_NOTIFY_BIN:-/usr/sbin/tsem-notify}" ] && { [ "$1" != "$2" ] || [ -s "$TSEM_RUN_DIR/notify.queue" ]; }; then
+		( "${TSEM_NOTIFY_BIN:-/usr/sbin/tsem-notify}" tick "$1" "$2" >/dev/null 2>&1 9>&- & )
+	fi
+	return 0
 }
 
 cmd_tick() {
@@ -238,9 +256,14 @@ cmd_tick() {
 	FO_FAILOVER_MODE=$_fom FORCE=$_tk_force
 	_old=$(fo_state_name german)
 	fo_step
-	FO_PS=fail FO_SS=fail FO_PK=$PR_KP FO_SK=$PR_KS
-	[ "$SIG_P" = 1 ] && FO_PS=ok
-	[ "$SIG_S" = 1 ] && FO_SS=ok
+	_pn=1
+	while [ "$_pn" -le "$TSEM_MAX_NODES" ]; do
+		_sg=0 _kk=unknown
+		eval "_sg=\${SIG_$_pn:-0} _kk=\${PR_K_$_pn:-unknown}"
+		case $_sg in 1) _fo_set FO_PS "$_pn" ok ;; *) _fo_set FO_PS "$_pn" fail ;; esac
+		_fo_set FO_PK "$_pn" "$_kk"
+		_pn=$((_pn + 1))
+	done
 	FO_DNS=$PR_DNS FO_CHK=$NOW
 	[ "$FO_VER" = 1 ] || FO_DNS=skip
 	_new=$(fo_state_name german)
@@ -256,6 +279,7 @@ cmd_tick() {
 	fi
 	fo_save
 	lock_release
+	_notify_change "$_old" "$_new"
 	[ "$FO_FORCE_REFUSED" = 0 ] || return 4
 	return "$_rc"
 }
@@ -304,6 +328,8 @@ cmd_set() {
 	_fo=auto
 	[ "$_irc" -ne 0 ] || _fo=$I_FAILOVER
 	_changed=0 _rc=0
+	_pst=''
+	if [ "$_irc" -eq 0 ]; then fo_load; _pst=$(fo_state_name "$I_MODE"); fi
 	if [ "$_irc" -eq 0 ] && [ "$I_MODE" = "$_mode" ]; then
 		log "already in $_mode (no change)"
 	else
@@ -321,6 +347,10 @@ cmd_set() {
 	lock_release
 	# every mode request is traceable: who asked (source), what, whether it changed anything, and how the apply ended
 	log "set $_mode requested by source=$_src changed=$_changed apply_rc=$_rc wait=$_wait"
+	# a message for the modes that do not go through a tick; EXIT is announced when it is really active (tick)
+	if [ "$_changed" -eq 1 ] && [ -n "$_pst" ]; then
+		case $_mode in direct) _notify_change "$_pst" DISABLED ;; blocked) _notify_change "$_pst" BLOCKED ;; esac
+	fi
 
 	if [ "$_mode" = german ] && [ "$_changed" -eq 1 ] && [ "$_wait" -eq 1 ]; then
 		_wait_active
@@ -471,6 +501,18 @@ cmd_status() {
 	case $_state in PRIMARY_ACTIVE | SECONDARY_ACTIVE | DEGRADED) _aname=$(name_of "$FO_CUR" | tr -cd "A-Za-z0-9._-"); [ -n "$_aname" ] || _aname=none ;; esac
 	_pname=$(printf %s "$TSEM_PRIMARY_NAME" | tr -cd "A-Za-z0-9._-"); [ -n "$_pname" ] || _pname=none
 	_sname=$(printf %s "$TSEM_SECONDARY_NAME" | tr -cd "A-Za-z0-9._-"); [ -n "$_sname" ] || _sname=none
+	_arank=0
+	case $_state in PRIMARY_ACTIVE | SECONDARY_ACTIVE | DEGRADED) case $FO_CUR in [1-8]) _arank=$FO_CUR ;; esac ;; esac
+	_nl_json='' _nl_txt='' _nli=1
+	while [ "$_nli" -le "${TSEM_NODE_COUNT:-0}" ]; do
+		_nlip=$(node_ip "$_nli"); _nlnm=$(node_name "$_nli" | tr -cd "A-Za-z0-9._-")
+		_nlok=$(_fo_v FO_PS "$_nli"); [ "$_nlok" != 0 ] || _nlok=unknown
+		_nlpk=$(_fo_v FO_PK "$_nli"); [ "$_nlpk" != 0 ] || _nlpk=unknown
+		_nl_json="${_nl_json}${_nl_json:+,}{\"rank\":$_nli,\"ip\":\"$_nlip\",\"name\":\"$_nlnm\",\"ok\":\"$_nlok\",\"probe\":\"$_nlpk\"}"
+		_nl_txt="${_nl_txt}node_$_nli=$_nlip|${_nlnm:--}|$_nlok|$_nlpk
+"
+		_nli=$((_nli + 1))
+	done
 	_hw=unknown _hwm=unknown _hws=none _hwt=0
 	# Sources of the switch position, strongest first (F04). Only gpio and file READ the position; event and
 	# persisted only REMEMBER what the firmware reported to the hook (the switch may have moved while the router was off).
@@ -521,27 +563,27 @@ cmd_status() {
 	#   successes:A/B,dwell:Ns,backoff:Ms   A of B consecutive primary successes seen, seconds of dwell and of backoff left
 	#   primary_not_usable   all counters satisfied but the primary does not currently answer
 	_rw=none
-	if [ "$_irc" -eq 0 ] && [ "$I_MODE" = german ] && [ "$FO_CUR" = secondary ] && [ "$FO_VER" = 1 ]; then
+	if [ "$_irc" -eq 0 ] && [ "$I_MODE" = german ] && case $FO_CUR in [2-8]) true ;; *) false ;; esac && [ "$FO_VER" = 1 ]; then
 		if [ "${TSEM_AUTO_RETURN:-1}" != 1 ] || [ "${I_FAILOVER:-auto}" != auto ]; then _rw=disabled
 		else
 			_rn=$(now)
-			_rok=$((TSEM_RETURN_N - FO_OKP)); [ "$_rok" -gt 0 ] || _rok=0
+			_rok=$((TSEM_RETURN_N - FO_OK_1)); [ "$_rok" -gt 0 ] || _rok=0
 			_rdw=$((TSEM_DWELL - (_rn - FO_LAST))); [ "$_rdw" -gt 0 ] || _rdw=0
-			_rbo=$((FO_DEADP - _rn)); [ "$_rbo" -gt 0 ] || _rbo=0
+			_rbo=$((FO_DEAD_1 - _rn)); [ "$_rbo" -gt 0 ] || _rbo=0
 			if [ "$_rok" -eq 0 ] && [ "$_rdw" -eq 0 ] && [ "$_rbo" -eq 0 ]; then _rw=primary_not_usable
-			else _rw="successes:${FO_OKP}/${TSEM_RETURN_N},dwell:${_rdw}s,backoff:${_rbo}s"; fi
+			else _rw="successes:${FO_OK_1}/${TSEM_RETURN_N},dwell:${_rdw}s,backoff:${_rbo}s"; fi
 		fi
 	fi
 	if [ "$_json" -eq 1 ]; then
-		printf '{"version":"%s","intent":"%s","intent_reason":"%s","mode":"%s","state":"%s","desired_guard":"%s","guard":"%s","kill_switch_active":%s,"leak_risk":%s,"exit_node":"%s","active_exit":"%s","primary":"%s","primary_ok":"%s","primary_probe":"%s","secondary":"%s","secondary_ok":"%s","secondary_probe":"%s","failover":"%s","dns":"%s","seq":%s,"source":"%s","last_check":%s,"error":"%s","boot_failed":"%s","hw_state":"%s","hw_match":"%s","auto_return":%s,"last_change":%s,"ipv6_protection":"%s","dns_protection":"%s","hw_source":"%s","hw_event_ts":%s,"return_wait":"%s","mode_label":"%s","active_exit_name":"%s","primary_name":"%s","secondary_name":"%s"}\n' \
+		printf '{"version":"%s","intent":"%s","intent_reason":"%s","mode":"%s","state":"%s","desired_guard":"%s","guard":"%s","kill_switch_active":%s,"leak_risk":%s,"exit_node":"%s","active_exit":"%s","primary":"%s","primary_ok":"%s","primary_probe":"%s","secondary":"%s","secondary_ok":"%s","secondary_probe":"%s","failover":"%s","dns":"%s","seq":%s,"source":"%s","last_check":%s,"error":"%s","boot_failed":"%s","hw_state":"%s","hw_match":"%s","auto_return":%s,"last_change":%s,"ipv6_protection":"%s","dns_protection":"%s","hw_source":"%s","hw_event_ts":%s,"return_wait":"%s","mode_label":"%s","active_exit_name":"%s","primary_name":"%s","secondary_name":"%s","nodes":%s,"active_rank":%s,"node_list":[%s]}\n' \
 			"$TSEM_VERSION" "$_intent" "$I_WHY" "$_desired" "$_state" "$_gwant" "$_guard" "$_ks" "$_leak" "$_exit" "$_active" \
-			"$_p" "${FO_PS:-unknown}" "${FO_PK:-unknown}" "$_s" "${FO_SS:-unknown}" "${FO_SK:-unknown}" "${I_FAILOVER:-auto}" "$FO_DNS" "${I_SEQ:-0}" "${I_SRC:-}" \
-			"$FO_CHK" "$FO_ERR" "$_bootfail" "$_hw" "$_hwm" "$_ar" "${I_TS:-0}" "$_v6" "$_dnsr" "$_hws" "${_hwt:-0}" "$_rw" "$TSEM_MODE_LABEL" "$_aname" "$_pname" "$_sname"
+			"$_p" "$(_fo_v FO_PS 1)" "$(_fo_v FO_PK 1)" "$_s" "$(_fo_v FO_PS 2)" "$(_fo_v FO_PK 2)" "${I_FAILOVER:-auto}" "$FO_DNS" "${I_SEQ:-0}" "${I_SRC:-}" \
+			"$FO_CHK" "$FO_ERR" "$_bootfail" "$_hw" "$_hwm" "$_ar" "${I_TS:-0}" "$_v6" "$_dnsr" "$_hws" "${_hwt:-0}" "$_rw" "$TSEM_MODE_LABEL" "$_aname" "$_pname" "$_sname" "${TSEM_NODE_COUNT:-0}" "$_arank" "$_nl_json"
 	else
-		printf 'version=%s\nintent=%s\nintent_reason=%s\nmode=%s\nstate=%s\ndesired_guard=%s\nguard=%s\nkill_switch_active=%s\nleak_risk=%s\nexit_node=%s\nactive_exit=%s\nprimary=%s\nprimary_ok=%s\nprimary_probe=%s\nsecondary=%s\nsecondary_ok=%s\nsecondary_probe=%s\nfailover=%s\ndns=%s\nseq=%s\nsource=%s\nlast_check=%s\nerror=%s\nboot_failed=%s\nhw_state=%s\nhw_match=%s\nauto_return=%s\nlast_change=%s\nipv6_protection=%s\ndns_protection=%s\nhw_source=%s\nhw_event_ts=%s\nreturn_wait=%s\nmode_label=%s\nactive_exit_name=%s\nprimary_name=%s\nsecondary_name=%s\n' \
+		printf 'version=%s\nintent=%s\nintent_reason=%s\nmode=%s\nstate=%s\ndesired_guard=%s\nguard=%s\nkill_switch_active=%s\nleak_risk=%s\nexit_node=%s\nactive_exit=%s\nprimary=%s\nprimary_ok=%s\nprimary_probe=%s\nsecondary=%s\nsecondary_ok=%s\nsecondary_probe=%s\nfailover=%s\ndns=%s\nseq=%s\nsource=%s\nlast_check=%s\nerror=%s\nboot_failed=%s\nhw_state=%s\nhw_match=%s\nauto_return=%s\nlast_change=%s\nipv6_protection=%s\ndns_protection=%s\nhw_source=%s\nhw_event_ts=%s\nreturn_wait=%s\nmode_label=%s\nactive_exit_name=%s\nprimary_name=%s\nsecondary_name=%s\nnodes=%s\nactive_rank=%s\n%s' \
 			"$TSEM_VERSION" "$_intent" "$I_WHY" "$_desired" "$_state" "$_gwant" "$_guard" "$_ks" "$_leak" "$_exit" "$_active" \
-			"$_p" "${FO_PS:-unknown}" "${FO_PK:-unknown}" "$_s" "${FO_SS:-unknown}" "${FO_SK:-unknown}" "${I_FAILOVER:-auto}" "$FO_DNS" "${I_SEQ:-0}" "${I_SRC:-}" \
-			"$FO_CHK" "$FO_ERR" "$_bootfail" "$_hw" "$_hwm" "$_ar" "${I_TS:-0}" "$_v6" "$_dnsr" "$_hws" "${_hwt:-0}" "$_rw" "$TSEM_MODE_LABEL" "$_aname" "$_pname" "$_sname"
+			"$_p" "$(_fo_v FO_PS 1)" "$(_fo_v FO_PK 1)" "$_s" "$(_fo_v FO_PS 2)" "$(_fo_v FO_PK 2)" "${I_FAILOVER:-auto}" "$FO_DNS" "${I_SEQ:-0}" "${I_SRC:-}" \
+			"$FO_CHK" "$FO_ERR" "$_bootfail" "$_hw" "$_hwm" "$_ar" "${I_TS:-0}" "$_v6" "$_dnsr" "$_hws" "${_hwt:-0}" "$_rw" "$TSEM_MODE_LABEL" "$_aname" "$_pname" "$_sname" "${TSEM_NODE_COUNT:-0}" "$_arank" "$_nl_txt"
 	fi
 	[ "$_leak" = false ]
 }
@@ -675,6 +717,11 @@ cmd_selftest() {
 	none) _st_pass fastpath "no SFE/shortcut-fe module and no FLOWOFFLOAD rule" ;;
 	*) _st_warn fastpath "$_fp: bypasses iptables/ip rules for established flows; tsem (TSEM_FASTPATH=$TSEM_FASTPATH) $([ "$TSEM_FASTPATH" = unload ] && echo 'removes the modules when the guard closes' || echo 'will report the guard inconsistent')" ;;
 	esac
+	# GL.iNet multi-WAN in balance mode with two uplinks splits connections by destination: a weak uplink (for example cellular) breaks only some
+	# destinations while the router is in DIRECT (found on a GL-E5800). The exit-node mode is not affected (only the tunnel uses the uplinks).
+	if command -v uci >/dev/null 2>&1 && [ "$(uci -q get kmwan.global.mode 2>/dev/null)" = balance ] && [ "$(ip route show default 2>/dev/null | grep -c nexthop)" -ge 2 ]; then
+		_st_warn multiwan "kmwan balance mode with two uplinks: some destinations may fail in DIRECT if one uplink is weak; 'uci set kmwan.global.mode=failover; uci commit kmwan; /etc/init.d/kmwan reload' prefers the first uplink"
+	fi
 	if ip rule help 2>&1 | grep -q prohibit; then _st_pass ip-rule-deny "prohibit listed by ip rule help"
 	else _st_pass ip-rule-deny "not listed by ip help (normal); fail-closed fallback prohibit>unreachable>blackhole, verified on install (TSEM_RT_DENY=$TSEM_RT_DENY)"; fi
 	_tp=$(ip rule show 2>/dev/null | awk -v t="$TSEM_TS_TABLE" '$0 ~ ("lookup " t "$") { sub(":","",$1); print $1; exit }')
@@ -794,27 +841,31 @@ cmd_daemon() {
 
 cmd_verify_nodes() {
 	_vn_rc=0
-	if [ -n "$TSEM_PRIMARY_NAME$TSEM_SECONDARY_NAME" ]; then
-		be_nodes_scan >/dev/null 2>&1 || true
-	fi
-	for _vn in primary secondary; do
+	case $TSEM_NODE_NAMES in *[A-Za-z0-9]*) be_nodes_scan >/dev/null 2>&1 || true ;; esac
+	_vn_max=${TSEM_NODE_COUNT:-0}
+	[ "$_vn_max" -ge 2 ] || _vn_max=2
+	_vn=1
+	while [ "$_vn" -le "$_vn_max" ]; do
+		case $_vn in 1) _vl=primary ;; 2) _vl=secondary ;; *) _vl="node$_vn" ;; esac
 		_vip=$(node_of "$_vn")
 		_vname=$(name_of "$_vn")
 		if [ -z "$_vip" ]; then
-			if [ "$_vn" = primary ]; then echo "FAIL primary: not configured"; _vn_rc=1; else echo "WARN secondary: not configured (no failover)"; fi
+			if [ "$_vn" = 1 ]; then echo "FAIL primary: not configured"; _vn_rc=1; else echo "WARN $_vl: not configured (no failover)"; fi
+			_vn=$((_vn + 1))
 			continue
 		fi
 		_vwhy=$(be_node_why "$_vname" "$_vip")
 		_vr=$?
 		if [ "$_vr" -eq 0 ]; then
 			case $_vwhy in
-			*"NOT verified"*) echo "WARN $_vn: ${_vname:-<no name>} $_vip: $_vwhy" ;;
-			*) echo "PASS $_vn: $_vname $_vip: $_vwhy" ;;
+			*"NOT verified"*) echo "WARN $_vl: ${_vname:-<no name>} $_vip: $_vwhy" ;;
+			*) echo "PASS $_vl: $_vname $_vip: $_vwhy" ;;
 			esac
 		else
-			echo "FAIL $_vn: ${_vname:-<no name>} $_vip: $_vwhy"
+			echo "FAIL $_vl: ${_vname:-<no name>} $_vip: $_vwhy"
 			_vn_rc=1
 		fi
+		_vn=$((_vn + 1))
 	done
 	return "$_vn_rc"
 }
@@ -822,10 +873,13 @@ cmd_verify_nodes() {
 # ----------------------------------------------------------- configuration (GUI / API)
 
 # Only these keys can be changed from outside; everything else stays an expert edit of tsem.conf.
-_CFG_EDIT="TSEM_PRIMARY TSEM_PRIMARY_NAME TSEM_SECONDARY TSEM_SECONDARY_NAME TSEM_AUTO_RETURN TSEM_MODE_LABEL TSEM_ALLOW_SUBNETS4 TSEM_HW_AT_BOOT"
+# The exit nodes are an ordered list (TSEM_NODES / TSEM_NODE_NAMES). TSEM_PRIMARY/SECONDARY (+ _NAME) still work: they set rank 1 and 2.
+_CFG_EDIT="TSEM_NODES TSEM_NODE_NAMES TSEM_PRIMARY TSEM_PRIMARY_NAME TSEM_SECONDARY TSEM_SECONDARY_NAME TSEM_AUTO_RETURN TSEM_MODE_LABEL TSEM_ALLOW_SUBNETS4 TSEM_HW_AT_BOOT"
 
 _cfg_valid() { # KEY VALUE
 	case $1 in
+	TSEM_NODES) _cf_check_nodes "$2" ;;
+	TSEM_NODE_NAMES) _cf_check_names "$2" ;;
 	TSEM_PRIMARY) valid_ip4 "$2" ;;
 	TSEM_SECONDARY) [ -z "$2" ] || valid_ip4 "$2" ;;
 	TSEM_PRIMARY_NAME | TSEM_SECONDARY_NAME)
@@ -849,6 +903,31 @@ _cfg_valid() { # KEY VALUE
 	esac
 }
 
+# list helpers for the node list: replace / delete word N (names are padded with "-")
+_lw_set() { # LIST N VALUE
+	_ls_list=$1 _ls_n=$2 _ls_val=$3 _ls_i=1 _ls_out=''
+	for _ls_w in $_ls_list; do
+		[ "$_ls_i" -ne "$_ls_n" ] || _ls_w=$_ls_val
+		_ls_out="$_ls_out $_ls_w"
+		_ls_i=$((_ls_i + 1))
+	done
+	while [ "$_ls_i" -le "$_ls_n" ]; do
+		if [ "$_ls_i" -eq "$_ls_n" ]; then _ls_out="$_ls_out $_ls_val"; else _ls_out="$_ls_out -"; fi
+		_ls_i=$((_ls_i + 1))
+	done
+	# shellcheck disable=SC2086
+	echo $_ls_out
+}
+_lw_del() { # LIST N
+	_ld_i=1 _ld_out=''
+	for _ld_w in $1; do
+		[ "$_ld_i" -eq "$2" ] || _ld_out="$_ld_out $_ld_w"
+		_ld_i=$((_ld_i + 1))
+	done
+	# shellcheck disable=SC2086
+	echo $_ld_out
+}
+
 cmd_config() {
 	_cc_sub=${1:-}
 	[ $# -gt 0 ] && shift
@@ -856,50 +935,95 @@ cmd_config() {
 	get)
 		intent_read; _cc_irc=$?
 		_cc_fo=unknown; [ "$_cc_irc" -ne 0 ] || _cc_fo=$I_FAILOVER
+		_cc_nl_json='' _cc_nl_txt='' _cc_i=1
+		while [ "$_cc_i" -le "${TSEM_NODE_COUNT:-0}" ]; do
+			_cc_ip=$(node_ip "$_cc_i"); _cc_nm=$(node_name "$_cc_i")
+			_cc_nl_json="${_cc_nl_json}${_cc_nl_json:+,}{\"rank\":$_cc_i,\"ip\":\"$_cc_ip\",\"name\":\"$_cc_nm\"}"
+			_cc_nl_txt="${_cc_nl_txt}node_$_cc_i=$_cc_ip|${_cc_nm:--}
+"
+			_cc_i=$((_cc_i + 1))
+		done
 		if [ "${1:-}" = --json ]; then
 			# read-only parameters (changing them is not offered by the API: they shape the kill switch and failover timing)
 			_cc_n() { case $1 in '' | *[!0-9]*) echo 0 ;; *) echo "$1" ;; esac; }
 			_cc_sub4=$(printf '%s' "${TSEM_ALLOW_SUBNETS4:-}" | tr -c '0-9./: ' ' ' | sed 's/  */ /g; s/^ //; s/ $//')
-			printf '{"primary":"%s","primary_name":"%s","secondary":"%s","secondary_name":"%s","auto_return":%s,"failover":"%s","mode_label":"%s","hw_at_boot":"%s","params":{"interval":%s,"interval_recovery":%s,"fail_n":%s,"up_n":%s,"return_n":%s,"dwell":%s,"backoff_min":%s,"backoff_max":%s,"probe_timeout":%s,"allow_subnets4":"%s"}}\n' \
-				"$TSEM_PRIMARY" "$TSEM_PRIMARY_NAME" "$TSEM_SECONDARY" "$TSEM_SECONDARY_NAME" "$([ "$TSEM_AUTO_RETURN" = 1 ] && echo true || echo false)" "$_cc_fo" "$TSEM_MODE_LABEL" "$TSEM_HW_AT_BOOT" \
+			printf '{"primary":"%s","primary_name":"%s","secondary":"%s","secondary_name":"%s","nodes":[%s],"max_nodes":%s,"auto_return":%s,"failover":"%s","mode_label":"%s","hw_at_boot":"%s","params":{"interval":%s,"interval_recovery":%s,"fail_n":%s,"up_n":%s,"return_n":%s,"dwell":%s,"backoff_min":%s,"backoff_max":%s,"probe_timeout":%s,"allow_subnets4":"%s"}}\n' \
+				"$TSEM_PRIMARY" "$TSEM_PRIMARY_NAME" "$TSEM_SECONDARY" "$TSEM_SECONDARY_NAME" "$_cc_nl_json" "$TSEM_MAX_NODES" "$([ "$TSEM_AUTO_RETURN" = 1 ] && echo true || echo false)" "$_cc_fo" "$TSEM_MODE_LABEL" "$TSEM_HW_AT_BOOT" \
 				"$(_cc_n "$TSEM_INTERVAL")" "$(_cc_n "$TSEM_INTERVAL_RECOVERY")" "$(_cc_n "$TSEM_FAIL_N")" "$(_cc_n "$TSEM_UP_N")" "$(_cc_n "$TSEM_RETURN_N")" \
 				"$(_cc_n "$TSEM_DWELL")" "$(_cc_n "$TSEM_BACKOFF_MIN")" "$(_cc_n "$TSEM_BACKOFF_MAX")" "$(_cc_n "$TSEM_PROBE_TIMEOUT")" "$_cc_sub4"
 		else
-			printf 'primary=%s\nprimary_name=%s\nsecondary=%s\nsecondary_name=%s\nauto_return=%s\nfailover=%s\n' \
-				"$TSEM_PRIMARY" "$TSEM_PRIMARY_NAME" "$TSEM_SECONDARY" "$TSEM_SECONDARY_NAME" "$TSEM_AUTO_RETURN" "$_cc_fo"
+			printf 'primary=%s\nprimary_name=%s\nsecondary=%s\nsecondary_name=%s\nauto_return=%s\nfailover=%s\n%s' \
+				"$TSEM_PRIMARY" "$TSEM_PRIMARY_NAME" "$TSEM_SECONDARY" "$TSEM_SECONDARY_NAME" "$TSEM_AUTO_RETURN" "$_cc_fo" "$_cc_nl_txt"
 		fi
 		;;
 	set)
 		[ $# -ge 1 ] || die "usage: tsem config set KEY=VALUE ... (keys: $_CFG_EDIT)"
-		_cc_np=$TSEM_PRIMARY _cc_ns=$TSEM_SECONDARY _cc_nodes=0 _cc_sub=0
+		_cc_args="$*"
+		_cc_nl=$TSEM_NODES _cc_nn=$TSEM_NODE_NAMES _cc_sub=0 _cc_nodekeys=0 _cc_other=''
 		for _cc_a in "$@"; do
 			case $_cc_a in *=*) ;; *) DIE_RC=2 die "expected KEY=VALUE, got '$(safe_word "$_cc_a")'" ;; esac
 			_cc_k=${_cc_a%%=*} _cc_v=${_cc_a#*=}
 			case " $_CFG_EDIT " in *" $_cc_k "*) ;; *) DIE_RC=2 die "key '$(safe_word "$_cc_k")' cannot be changed here" ;; esac
 			_cfg_valid "$_cc_k" "$_cc_v" || DIE_RC=2 die "invalid value for $_cc_k"
 			case $_cc_k in
-			# only a REAL change restarts the verification / re-applies the rules (the GUI always sends every field)
-			TSEM_PRIMARY) _cc_np=$_cc_v; [ "$_cc_v" = "$TSEM_PRIMARY" ] || _cc_nodes=1 ;;
-			TSEM_SECONDARY) _cc_ns=$_cc_v; [ "$_cc_v" = "$TSEM_SECONDARY" ] || _cc_nodes=1 ;;
-			TSEM_PRIMARY_NAME) [ "$_cc_v" = "$TSEM_PRIMARY_NAME" ] || _cc_nodes=1 ;;
-			TSEM_SECONDARY_NAME) [ "$_cc_v" = "$TSEM_SECONDARY_NAME" ] || _cc_nodes=1 ;;
-			TSEM_ALLOW_SUBNETS4) [ "$(printf '%s
-' $_cc_v | sort | tr '
-' ' ')" = "$(printf '%s
-' ${TSEM_ALLOW_SUBNETS4:-} | sort | tr '
-' ' ')" ] || _cc_sub=1 ;;
+			TSEM_NODES) _cc_nl=$_cc_v; _cc_nodekeys=1 ;;
+			TSEM_NODE_NAMES) _cc_nn=$_cc_v; _cc_nodekeys=1 ;;
+			TSEM_PRIMARY) _cc_nl=$(_lw_set "$_cc_nl" 1 "$_cc_v"); _cc_nodekeys=1 ;;
+			TSEM_SECONDARY)
+				if [ -z "$_cc_v" ]; then _cc_nl=$(_lw_del "$_cc_nl" 2); _cc_nn=$(_lw_del "$_cc_nn" 2); else _cc_nl=$(_lw_set "$_cc_nl" 2 "$_cc_v"); fi
+				_cc_nodekeys=1 ;;
+			TSEM_PRIMARY_NAME) _cc_nn=$(_lw_set "$_cc_nn" 1 "${_cc_v:--}"); _cc_nodekeys=1 ;;
+			TSEM_SECONDARY_NAME) _cc_nn=$(_lw_set "$_cc_nn" 2 "${_cc_v:--}"); _cc_nodekeys=1 ;;
+			TSEM_ALLOW_SUBNETS4)
+				_cc_old=$(printf '%s\n' ${TSEM_ALLOW_SUBNETS4:-} | sort | tr '\n' ' ')
+				_cc_new=$(printf '%s\n' $_cc_v | sort | tr '\n' ' ')
+				[ "$_cc_new" = "$_cc_old" ] || _cc_sub=1
+				_cc_other="$_cc_other
+$_cc_a" ;;
+			*) _cc_other="$_cc_other
+$_cc_a" ;;
 			esac
 		done
-		[ -n "$_cc_np" ] || DIE_RC=2 die "the primary exit node cannot be empty"
-		[ -z "$_cc_ns" ] || [ "$_cc_ns" != "$_cc_np" ] || DIE_RC=2 die "primary and secondary must be different nodes"
+		_cf_check_nodes "$_cc_nl" || DIE_RC=2 die "the exit node list is invalid (at most $TSEM_MAX_NODES different IPv4 addresses)"
+		[ -n "$_cc_nl" ] || DIE_RC=2 die "the primary exit node cannot be empty"
+		# the names list never has more entries than the node list, and is empty when no node has a name
+		_cc_cnt=0; for _cc_w in $_cc_nl; do _cc_cnt=$((_cc_cnt + 1)); done
+		_cc_nn2='' _cc_i=1 _cc_any=0
+		for _cc_w in $_cc_nn; do
+			[ "$_cc_i" -le "$_cc_cnt" ] || break
+			_cc_nn2="$_cc_nn2 $_cc_w"
+			[ "$_cc_w" = - ] || _cc_any=1
+			_cc_i=$((_cc_i + 1))
+		done
+		# shellcheck disable=SC2086
+		if [ "$_cc_any" -eq 1 ]; then _cc_nn=$(echo $_cc_nn2); else _cc_nn=''; fi
+		_cc_nodes=0
+		{ [ "$_cc_nl" = "$TSEM_NODES" ] && [ "$_cc_nn" = "$TSEM_NODE_NAMES" ]; } || _cc_nodes=1
+		# shellcheck disable=SC2086
+		set -- $_cc_nl
+		_cc_p1=${1:-} _cc_p2=${2:-}
+		_cc_w1=$(_lw_get "$_cc_nn" 1)
+		_cc_w2=$(_lw_get "$_cc_nn" 2)
 		lock_acquire
 		_cc_tmp=$TSEM_CONF.tsem-new.$$
 		{ [ -f "$TSEM_CONF" ] && cat "$TSEM_CONF"; true; } >"$_cc_tmp" 2>/dev/null || { lock_release; die "cannot write configuration"; }
-		for _cc_a in "$@"; do
+		# the node keys are always written together, so the list and the older keys never disagree
+		_cc_pairs=$_cc_other
+		if [ "$_cc_nodekeys" -eq 1 ]; then
+			_cc_pairs="$_cc_pairs
+TSEM_NODES=$_cc_nl
+TSEM_NODE_NAMES=$_cc_nn
+TSEM_PRIMARY=$_cc_p1
+TSEM_SECONDARY=$_cc_p2
+TSEM_PRIMARY_NAME=$_cc_w1
+TSEM_SECONDARY_NAME=$_cc_w2"
+		fi
+		printf '%s\n' "$_cc_pairs" | while IFS= read -r _cc_a; do
+			[ -n "$_cc_a" ] || continue
 			_cc_k=${_cc_a%%=*} _cc_v=${_cc_a#*=}
 			awk -v k="$_cc_k" -v v="$_cc_v" 'BEGIN { d = 0 } index($0, k "=") == 1 && !d { print k "=" v; d = 1; next } { print } END { if (!d) print k "=" v }' "$_cc_tmp" >"$_cc_tmp.2" &&
-				mv -f "$_cc_tmp.2" "$_cc_tmp" || { rm -f "$_cc_tmp" "$_cc_tmp.2"; lock_release; die "cannot write configuration"; }
-		done
+				mv -f "$_cc_tmp.2" "$_cc_tmp" || exit 1
+		done || { rm -f "$_cc_tmp" "$_cc_tmp.2"; lock_release; die "cannot write configuration"; }
 		[ ! -f "$TSEM_CONF" ] || cp -p "$TSEM_CONF" "$TSEM_CONF.bak" 2>/dev/null
 		mv -f "$_cc_tmp" "$TSEM_CONF" || { rm -f "$_cc_tmp"; lock_release; die "cannot write configuration"; }
 		# new exit nodes: the controller starts verifying from scratch; the guard stays closed meanwhile (never opens)
@@ -913,11 +1037,20 @@ cmd_config() {
 			esac
 		fi
 		lock_release
-		log "config set: $*"
+		log "config set: $_cc_args"
 		echo "configuration saved"
 		;;
 	*) die "usage: tsem config get [--json] | config set KEY=VALUE ..." ;;
 	esac
+}
+
+_lw_get() { # LIST N -> word N, empty if it is "-" or missing
+	_lg_i=1
+	for _lg_w in $1; do
+		if [ "$_lg_i" -eq "$2" ]; then [ "$_lg_w" = - ] || printf '%s' "$_lg_w"; return 0; fi
+		_lg_i=$((_lg_i + 1))
+	done
+	return 0
 }
 
 # nodes [--json]: the tailnet's exit-capable peers (read-only), marked with the role they have in the configuration.
@@ -930,8 +1063,8 @@ cmd_nodes() {
 		[ -n "$_nd_h" ] || continue
 		_nd_ip=${_nd_ips%%,*}
 		_nd_role=none
-		[ "$_nd_ip" != "$TSEM_PRIMARY" ] || _nd_role=primary
-		[ "$_nd_ip" != "$TSEM_SECONDARY" ] || [ -z "$TSEM_SECONDARY" ] || _nd_role=secondary
+		_nd_rk=$(node_rank "$_nd_ip")
+		case $_nd_rk in 0) ;; 1) _nd_role=primary ;; 2) _nd_role=secondary ;; *) _nd_role="node$_nd_rk" ;; esac
 		case "$_nd_on" in true | false) _nd_on_j=$_nd_on ;; *) _nd_on_j=null ;; esac # "unknown" (short peer form) is not "offline"
 		if [ "${1:-}" = --json ]; then
 			[ "$_nd_first" -eq 1 ] || printf ','
@@ -1007,6 +1140,52 @@ cmd_egress() {
 	return 0
 }
 
+# ---------------------------------------------------------------- backup / restore of the settings (v1.1)
+# What is saved: tsem.conf, notify.conf, mqtt.conf (those that exist). NOT saved: the mode (intent), tokens and password files.
+# A restore never changes the mode and never writes anything but these three names; the old files are kept as *.before-restore.
+_BK_FILES="tsem.conf notify.conf mqtt.conf"
+_bk_dir() { dirname "$TSEM_CONF"; }
+
+cmd_backup() {
+	_d=$(_bk_dir)
+	_out=${1:-/tmp/tsem-backup-$(cat /proc/sys/kernel/hostname 2>/dev/null || echo router)-$(date +%Y%m%d-%H%M%S).tar.gz}
+	_list=''
+	for _f in $_BK_FILES; do [ -f "$_d/$_f" ] && _list="$_list $_f"; done
+	[ -n "$_list" ] || { echo "tsem: nothing to back up in $_d" >&2; return 1; }
+	# shellcheck disable=SC2086
+	( cd "$_d" && tar czf "$_out" $_list ) || { echo "tsem: backup failed" >&2; return 1; }
+	chmod 600 "$_out" 2>/dev/null
+	echo "tsem: backup written: $_out (files:$_list). Mode, tokens and password files are not included."
+	echo "tsem: the file can hold addresses and names of your network: keep it private."
+}
+
+cmd_restore() {
+	_in=${1:-}
+	[ -f "$_in" ] || { echo "usage: tsem restore FILE.tar.gz" >&2; return 2; }
+	_d=$(_bk_dir)
+	_names=$(tar tzf "$_in" 2>/dev/null) || { echo "tsem: not a readable archive: $_in" >&2; return 1; }
+	[ -n "$_names" ] || { echo "tsem: empty archive" >&2; return 1; }
+	for _n in $_names; do
+		case " $_BK_FILES " in *" $_n "*) ;; *) echo "tsem: refusing: the archive contains '$_n' (only $_BK_FILES are allowed)" >&2; return 1 ;; esac
+	done
+	_tmp=$(mktemp -d "${TMPDIR:-/tmp}/tsem-restore.XXXXXX") || return 1
+	( cd "$_tmp" && tar xzf "$_in" $_names ) || { rm -rf "$_tmp"; echo "tsem: could not unpack" >&2; return 1; }
+	for _n in $_names; do
+		[ -f "$_tmp/$_n" ] && [ ! -L "$_tmp/$_n" ] || { rm -rf "$_tmp"; echo "tsem: refusing: '$_n' is not a plain file" >&2; return 1; }
+		# only comments, blank lines and KEY=VALUE lines; nothing that looks like a command
+		if grep -v -E '^([[:space:]]*#.*|[[:space:]]*|[A-Z][A-Z0-9_]*=.*)$' "$_tmp/$_n" | grep -q .; then rm -rf "$_tmp"; echo "tsem: refusing: '$_n' has lines that are not settings" >&2; return 1; fi
+		if grep -q -E '`|\$\(' "$_tmp/$_n"; then rm -rf "$_tmp"; echo "tsem: refusing: '$_n' contains command substitution" >&2; return 1; fi
+	done
+	for _n in $_names; do
+		[ ! -f "$_d/$_n" ] || cp -p "$_d/$_n" "$_d/$_n.before-restore" || { rm -rf "$_tmp"; echo "tsem: could not keep the old $_n" >&2; return 1; }
+		cp "$_tmp/$_n" "$_d/$_n.new" && mv "$_d/$_n.new" "$_d/$_n" || { rm -rf "$_tmp"; echo "tsem: could not write $_n" >&2; return 1; }
+		[ "$_n" = tsem.conf ] || chmod 600 "$_d/$_n" 2>/dev/null
+		echo "tsem: restored $_n (the old one is kept as $_n.before-restore)"
+	done
+	rm -rf "$_tmp"
+	echo "tsem: the mode was not changed. Check with: tsem verify-nodes; tsem selftest. A restart applies everything: /etc/init.d/tsem restart"
+}
+
 # hw-probe: READ-ONLY survey of everything that could tell where the hardware switch is and how the firmware
 # reports it (F04). Changes nothing; used once on the router to decide whether a position reader can be configured.
 cmd_hw_probe() {
@@ -1047,6 +1226,8 @@ daemon) cmd_daemon ;;
 boot) cmd_boot ;;
 reapply) cmd_reapply ;;
 deps) cmd_deps ;;
+backup) cmd_backup "$@" ;;
+restore) cmd_restore "$@" ;;
 teardown) cmd_teardown ;;
 diag) cmd_diag ;;
 selftest) cmd_selftest ;;

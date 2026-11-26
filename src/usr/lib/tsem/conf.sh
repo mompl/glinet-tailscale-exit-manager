@@ -7,6 +7,8 @@
 _cf_defaults() {
 	: "${TSEM_PRIMARY:=}"
 	: "${TSEM_SECONDARY:=}"
+	: "${TSEM_NODES:=}"
+	: "${TSEM_NODE_NAMES:=}"
 	: "${TSEM_LAN_IFACES:=br-lan}"
 	: "${TSEM_ALLOW_OUT_IFACES:=}"
 	: "${TSEM_TS_IFACE:=tailscale0}"
@@ -19,6 +21,8 @@ _cf_defaults() {
 	: "${TSEM_TAILNET6:=fd7a:115c:a1e0::/48}"
 	: "${TSEM_ALLOW_SUBNETS4:=}"
 	: "${TSEM_ALLOW_SUBNETS6:=}"
+	: "${TSEM_ADMIN_SUBNETS4:=}"
+	: "${TSEM_ADMIN_SUBNETS6:=}"
 	: "${TSEM_DNS_REDIRECT:=}"
 	: "${TSEM_DNS_ROUTER:=1.1.1.1}"
 	: "${TSEM_OUT_GUARD:=on}"
@@ -72,8 +76,76 @@ _cf_check_list() { # type value
 	return 0
 }
 
-_CF_KEYS="TSEM_PRIMARY TSEM_SECONDARY TSEM_LAN_IFACES TSEM_ALLOW_OUT_IFACES TSEM_TS_IFACE TSEM_TS_TABLE
-TSEM_RT_GUARD TSEM_RULE_PRIO TSEM_RT_DENY TSEM_FASTPATH TSEM_TAILNET4 TSEM_TAILNET6 TSEM_ALLOW_SUBNETS4 TSEM_ALLOW_SUBNETS6 TSEM_DNS_REDIRECT TSEM_DNS_ROUTER TSEM_OUT_GUARD TSEM_OUT_LOCAL_IFACES TSEM_ALLOW_NTP TSEM_ALLOW_UNDERLAY_DNS TSEM_UNDERLAY_MARK
+# The exit nodes are an ORDERED LIST (rank 1 = preferred). TSEM_NODES holds the addresses, TSEM_NODE_NAMES the names ("-" = none).
+# TSEM_PRIMARY / TSEM_SECONDARY (and their names) are the older form of rank 1 and 2: they are read when TSEM_NODES is empty and
+# are kept equal to rank 1 and 2 afterwards, so older tools keep working.
+TSEM_MAX_NODES=8
+
+_cf_check_nodes() { # at most TSEM_MAX_NODES valid, distinct IPv4 addresses
+	_cn_n=0 _cn_seen=' '
+	for _cn in $1; do
+		valid_ip4 "$_cn" || return 1
+		case $_cn_seen in *" $_cn "*) return 1 ;; esac
+		_cn_seen="$_cn_seen$_cn "
+		_cn_n=$((_cn_n + 1))
+	done
+	[ "$_cn_n" -le "$TSEM_MAX_NODES" ]
+}
+
+_cf_check_names() { # each name: letters, digits, dot, hyphen (max 63) or "-" for none
+	for _cn in $1; do
+		[ "$_cn" = - ] && continue
+		case $_cn in *[!A-Za-z0-9.-]* | -* | .*) return 1 ;; esac
+		[ "${#_cn}" -le 63 ] || return 1
+	done
+	return 0
+}
+
+node_ip() { # RANK -> address (empty if there is none)
+	_nip=$1
+	set -- $TSEM_NODES
+	eval "printf '%s' \"\${$_nip:-}\""
+}
+
+node_name() { # RANK -> name (empty if there is none)
+	_nnm=$1
+	set -- $TSEM_NODE_NAMES
+	_nnv=
+	eval "_nnv=\${$_nnm:-}"
+	[ "$_nnv" = - ] || printf '%s' "$_nnv"
+}
+
+node_rank() { # ADDRESS -> rank (0 = not configured)
+	_nrk=0 _nri=0
+	for _nr in $TSEM_NODES; do _nri=$((_nri + 1)); [ "$_nr" != "$1" ] || { _nrk=$_nri; break; }; done
+	echo "$_nrk"
+}
+
+# derive the effective list and keep the older keys equal to rank 1 and 2
+_cf_nodes() {
+	case " $_cf_envkeys " in
+	*" TSEM_PRIMARY "*) [ -n "$TSEM_NODES" ] && case " $_cf_envkeys " in *" TSEM_NODES "*) ;; *) TSEM_NODES='' TSEM_NODE_NAMES='' ;; esac ;;
+	esac
+	if [ -z "$TSEM_NODES" ]; then
+		TSEM_NODES=$TSEM_PRIMARY
+		[ -z "$TSEM_PRIMARY" ] || [ -z "$TSEM_SECONDARY" ] || [ "$TSEM_SECONDARY" = "$TSEM_PRIMARY" ] || TSEM_NODES="$TSEM_NODES $TSEM_SECONDARY"
+		TSEM_NODE_NAMES=''
+		if [ -n "$TSEM_PRIMARY_NAME$TSEM_SECONDARY_NAME" ]; then
+			TSEM_NODE_NAMES="${TSEM_PRIMARY_NAME:--}"
+			case " $TSEM_NODES " in *" $TSEM_SECONDARY "*) [ -z "$TSEM_SECONDARY" ] || [ -z "$TSEM_PRIMARY" ] || TSEM_NODE_NAMES="$TSEM_NODE_NAMES ${TSEM_SECONDARY_NAME:--}" ;; esac
+		fi
+	else
+		TSEM_PRIMARY=$(node_ip 1)
+		TSEM_SECONDARY=$(node_ip 2)
+		TSEM_PRIMARY_NAME=$(node_name 1)
+		TSEM_SECONDARY_NAME=$(node_name 2)
+	fi
+	set -- $TSEM_NODES
+	TSEM_NODE_COUNT=$#
+}
+
+_CF_KEYS="TSEM_NODES TSEM_NODE_NAMES TSEM_PRIMARY TSEM_SECONDARY TSEM_LAN_IFACES TSEM_ALLOW_OUT_IFACES TSEM_TS_IFACE TSEM_TS_TABLE
+TSEM_RT_GUARD TSEM_RULE_PRIO TSEM_RT_DENY TSEM_FASTPATH TSEM_TAILNET4 TSEM_TAILNET6 TSEM_ALLOW_SUBNETS4 TSEM_ALLOW_SUBNETS6 TSEM_ADMIN_SUBNETS4 TSEM_ADMIN_SUBNETS6 TSEM_DNS_REDIRECT TSEM_DNS_ROUTER TSEM_OUT_GUARD TSEM_OUT_LOCAL_IFACES TSEM_ALLOW_NTP TSEM_ALLOW_UNDERLAY_DNS TSEM_UNDERLAY_MARK
 TSEM_PRIMARY_NAME TSEM_SECONDARY_NAME TSEM_INTERVAL TSEM_INTERVAL_RECOVERY TSEM_INTERVAL_STEADY TSEM_INTERVAL_IDLE TSEM_FAIL_N TSEM_UP_N TSEM_RETURN_N TSEM_DWELL TSEM_AUTO_RETURN TSEM_BACKOFF_MIN TSEM_BACKOFF_MAX TSEM_LOCK_TIMEOUT
 TSEM_SET_TICKS TSEM_SET_TICK_DELAY TSEM_PROBE_URLS TSEM_PROBE_TIMEOUT TSEM_PROBE_CMD TSEM_DNS_PROBE_HOST TSEM_HW_STATE_FILE TSEM_HW_GPIO_VALUE TSEM_HW_GPIO_ON TSEM_MODE_LABEL TSEM_HW_AT_BOOT"
 
@@ -103,6 +175,10 @@ conf_load() {
 				if _cf_check_list iface "$_cf_v"; then _cf_set "$_cf_k" "$_cf_v"; else _cf_bad "$_cf_k"; fi ;;
 			TSEM_TS_IFACE)
 				if valid_iface "$_cf_v"; then _cf_set "$_cf_k" "$_cf_v"; else _cf_bad "$_cf_k"; fi ;;
+			TSEM_NODES)
+				if _cf_check_nodes "$_cf_v"; then _cf_set "$_cf_k" "$_cf_v"; else _cf_bad "$_cf_k"; fi ;;
+			TSEM_NODE_NAMES)
+				if _cf_check_names "$_cf_v"; then _cf_set "$_cf_k" "$_cf_v"; else _cf_bad "$_cf_k"; fi ;;
 			TSEM_PRIMARY_NAME | TSEM_SECONDARY_NAME)
 				case $_cf_v in '' | *[!A-Za-z0-9.-]* | -* | .*) if [ -z "$_cf_v" ]; then _cf_set "$_cf_k" ""; else _cf_bad "$_cf_k"; fi ;; *)
 					if [ "${#_cf_v}" -le 63 ]; then _cf_set "$_cf_k" "$_cf_v"; else _cf_bad "$_cf_k"; fi ;; esac ;;
@@ -136,6 +212,10 @@ conf_load() {
 				if _cf_check_list cidr4 "$_cf_v"; then _cf_set "$_cf_k" "$_cf_v"; else _cf_bad "$_cf_k"; fi ;;
 			TSEM_ALLOW_SUBNETS6)
 				if _cf_check_list cidr6 "$_cf_v"; then _cf_set "$_cf_k" "$_cf_v"; else _cf_bad "$_cf_k"; fi ;;
+			TSEM_ADMIN_SUBNETS4)
+				if _cf_check_list cidr4 "$_cf_v"; then _cf_set "$_cf_k" "$_cf_v"; else _cf_bad "$_cf_k"; fi ;;
+			TSEM_ADMIN_SUBNETS6)
+				if _cf_check_list cidr6 "$_cf_v"; then _cf_set "$_cf_k" "$_cf_v"; else _cf_bad "$_cf_k"; fi ;;
 			TSEM_DNS_REDIRECT | TSEM_DNS_ROUTER)
 				if [ -z "$_cf_v" ] || valid_ip4 "$_cf_v"; then _cf_set "$_cf_k" "$_cf_v"; else _cf_bad "$_cf_k"; fi ;;
 			TSEM_PROBE_URLS)
@@ -149,6 +229,7 @@ conf_load() {
 		done <"$TSEM_CONF"
 	fi
 	_cf_defaults
+	_cf_nodes
 	# sanity: counters must be >= 1, timing relations
 	[ "$TSEM_FAIL_N" -ge 1 ] || TSEM_FAIL_N=3
 	[ "$TSEM_UP_N" -ge 1 ] || TSEM_UP_N=2

@@ -40,6 +40,6 @@ test_intent_epoch_boundaries() {
 test_failover_state_keeps_epoch_valued_fields() {
 	t_setup
 	printf 'cur=primary\nver=1\nokp=3\nfailp=0\noks=0\nfails=0\nlast=1790000100\ndeadp=1790000200\ndeads=1790000300\nbop=20\nbos=20\ndns=ok\nchk=1790000400\nps=ok\nss=unknown\nerr=\n' >"$TSEM_RUN_DIR/failover"
-	_o=$("$SH" -c '. "$TSEM_LIBDIR/common.sh"; . "$TSEM_LIBDIR/conf.sh"; . "$TSEM_LIBDIR/failover.sh"; TSEM_BACKOFF_MIN=10; fo_load; echo "$FO_LAST $FO_DEADP $FO_DEADS $FO_CHK"')
+	_o=$("$SH" -c '. "$TSEM_LIBDIR/common.sh"; . "$TSEM_LIBDIR/conf.sh"; . "$TSEM_LIBDIR/failover.sh"; TSEM_BACKOFF_MIN=10; fo_load; echo "$FO_LAST $FO_DEAD_1 $FO_DEAD_2 $FO_CHK"')
 	assert_eq epochs "1790000100 1790000200 1790000300 1790000400" "$_o"
 }

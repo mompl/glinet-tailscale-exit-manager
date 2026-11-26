@@ -163,6 +163,18 @@ class ModelNameTest(unittest.TestCase):
         self.assertIsNone(model.derive(old)["active_exit_name"])
         self.assertEqual(model.derive(old)["active_exit_node"], "100.64.0.10")
 
+    def test_node_list_and_active_rank_pass_through_and_older_controllers_give_an_empty_list(self):
+        st = {"state": "SECONDARY_ACTIVE", "mode": "german", "guard": "german", "active_exit": "100.64.0.12", "active_rank": 3,
+              "node_list": [{"rank": 1, "ip": "100.64.0.10", "name": "a", "ok": "fail", "probe": "unreachable"},
+                            {"rank": 3, "ip": "100.64.0.12", "name": "", "ok": "ok", "probe": "egress"}, "junk"]}
+        d = model.derive(st)
+        self.assertEqual(d["active_rank"], 3)
+        self.assertEqual([n["rank"] for n in d["node_list"]], [1, 3])
+        self.assertIsNone(d["node_list"][1]["name"])
+        old = {k: v for k, v in st.items() if k not in ("node_list", "active_rank")}
+        self.assertEqual(model.derive(old)["node_list"], [])
+        self.assertIsNone(model.derive(old)["active_rank"])
+
 
 if __name__ == "__main__":
     unittest.main()

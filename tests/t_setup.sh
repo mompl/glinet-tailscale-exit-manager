@@ -43,6 +43,31 @@ test_setup_installs_configures_tests_starts_in_direct_and_reports_success() {
 	assert_contains steps "[6/6] Exit-node mode" "$(cat "$T/setup.out")"
 }
 
+test_setup_admin_subnet_is_saved_and_a_bad_value_is_refused() {
+	_su_env
+	_su --yes --primary node-a --admin-subnet 10.50.0.0/24 --admin-subnet 192.168.9.0/28 || fail "setup failed: $(cat "$T/setup.out")"
+	assert_contains saved 'TSEM_ADMIN_SUBNETS4="10.50.0.0/24 192.168.9.0/28"' "$(cat "$RT/etc/tsem/tsem.conf")"
+	assert_contains said "the router stays reachable over" "$(cat "$T/setup.out")"
+	_su_env
+	if _su --yes --admin-subnet '10.0.0.0/8;reboot'; then fail "a bad admin network must be refused"; fi
+	assert_contains why "only IPv4 networks" "$(cat "$T/setup.out")"
+}
+
+test_setup_fallback_adds_further_exit_nodes_in_order() {
+	_su_env
+	printf 'node-a|100.64.0.10|true|true|a\nnode-b|100.64.0.11|true|true|b\nnode-c|100.64.0.12|true|true|c\n' >"$TSEM_MOCK_DIR/peers"
+	_su --yes --primary node-a --secondary node-b --fallback node-c || fail "setup failed: $(cat "$T/setup.out")"
+	_f=$(cat "$RT/etc/tsem/tsem.conf")
+	assert_contains list "TSEM_NODES=100.64.0.10 100.64.0.11 100.64.0.12" "$_f"
+	assert_contains names "TSEM_NODE_NAMES=node-a node-b node-c" "$_f"
+	assert_contains older "TSEM_SECONDARY=100.64.0.11" "$_f"
+	assert_contains said "exit nodes in order" "$(cat "$T/setup.out")"
+	_su_env
+	printf 'node-a|100.64.0.10|true|true|a\n' >"$TSEM_MOCK_DIR/peers"
+	if _su --yes --primary node-a --fallback not-a-peer; then fail "an unknown fallback must fail the setup"; fi
+	assert_contains why "is not a peer of this tailnet" "$(cat "$T/setup.out")"
+}
+
 test_setup_with_an_unknown_node_fails_and_restores_the_previous_state() {
 	_su_env
 	if _su --yes --primary does-not-exist; then fail "an unknown exit node must fail the setup"; fi
@@ -302,4 +327,17 @@ test_setup_refreshes_a_saved_node_name_to_the_one_tailscale_shows() {
 	_su --yes || fail "re-run failed: $(cat "$T/setup.out")"
 	assert_contains refreshed "old-hostname -> node-b" "$(cat "$T/setup.out")"
 	assert_contains name "TSEM_SECONDARY_NAME=node-b" "$(cat "$RT/etc/tsem/tsem.conf")"
+}
+
+test_setup_update_of_a_protected_router_keeps_the_exit_mode_and_never_passes_through_direct() {
+	_su_adopt
+	_su --yes --adopt-exit-node || fail "first setup failed: $(cat "$T/setup.out")"
+	assert_eq mode german "$("$TSEM_BIN" status | sed -n 's/^mode=//p')"
+	: >"$T/service-running"
+	: >"$T/initd.calls"
+	_su --yes --primary node-a || fail "update failed: $(cat "$T/setup.out")"
+	assert_eq "still the exit mode" german "$("$TSEM_BIN" status | sed -n 's/^mode=//p')"
+	assert_contains kept "stayed protected" "$(cat "$T/setup.out")"
+	case $(cat "$T/setup.out") in *"running in DIRECT mode"*) fail "an update must not switch a protected router to DIRECT" ;; esac
+	assert_contains restarted "restart" "$(cat "$T/initd.calls")"
 }

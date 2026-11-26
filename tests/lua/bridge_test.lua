@@ -35,7 +35,7 @@ r = bridge.call({ m = "set_mode", p = { mode = string.rep("x", 200) } })
 check(r.ok == false and r.code == "invalid_argument", "an over-long string must be refused")
 
 -- the list of released networks (8 CIDRs = about 110 characters) is longer than a name but must pass; 200+ must not
-r = bridge.call({ m = "config_set", p = { allow_subnets4 = "10.76.0.0/24 10.76.1.0/24 10.76.2.0/24 10.77.0.0/23 10.77.2.0/23 10.79.0.0/24 10.80.0.0/24 192.168.0.0/23" } })
+r = bridge.call({ m = "config_set", p = { allow_subnets4 = "10.10.0.0/24 10.10.1.0/24 10.10.2.0/24 10.20.0.0/23 10.20.2.0/23 10.31.0.0/24 10.40.0.0/24 192.168.0.0/23" } })
 check(r.ok == true, "eight released networks must pass the bridge, got " .. tostring(r.code) .. " " .. tostring(r.error))
 r = bridge.call({ m = "config_set", p = { allow_subnets4 = string.rep("1", 201) } })
 check(r.ok == false and r.code == "invalid_argument", "an over-long network list must be refused")

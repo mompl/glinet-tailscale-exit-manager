@@ -40,3 +40,19 @@ What is proven and what is not, in one place:
 4. Optional: find a readable position source (`tsem hw-probe` lists sysfs GPIO and input candidates read-only) and set `TSEM_HW_GPIO_VALUE`/`TSEM_HW_GPIO_ON`.
 ## Polling
 Fast 5 s only for connecting/recovery/blocked/error/unknown intent; 15 s with secondary active; 20 s with primary active; 60 s in direct. Events act immediately. Expected load: each tick is one shell run with a few iptables-save/ip calls. Real CPU/wake numbers are not measured (hardware proof pending).
+
+## Several exit nodes (v1.1)
+
+The exit nodes are an ordered list. Rank 1 is preferred, the others are fallbacks in order. If the active node fails, the next
+selectable rank takes over (the guard stays closed while it is verified); when every node is down the router is BLOCKED, never DIRECT.
+When a better rank has been healthy again for `TSEM_RETURN_N` checks and `TSEM_DWELL` seconds, the router returns to the **best**
+healthy rank (not only to rank 1). `TSEM_AUTO_RETURN=0` keeps a fallback until it fails. `failover off` uses rank 1 only.
+
+```sh
+sh setup.sh --yes --primary a --secondary b --fallback c --fallback d      # install with four nodes
+tsem config set "TSEM_NODES=100.64.0.10 100.64.0.11 100.64.0.12" "TSEM_NODE_NAMES=a b c"
+tsem status | grep -E '^(nodes|active_rank|node_)'
+```
+
+The state names are unchanged (rank 1 = `PRIMARY_ACTIVE`, every other rank = `SECONDARY_ACTIVE`); `active_rank` says which one. The GL.iNet
+page, LuCI and the Home Assistant sensor show every node. Clearing the secondary in the GUI removes rank 2 and moves the fallbacks up.

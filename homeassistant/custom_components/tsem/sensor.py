@@ -51,7 +51,7 @@ class TsemSensor(TsemEntity, SensorEntity):
         if self._key == "state":
             return {"reached": d.get("reached"), "error": d.get("error"), "last_change_source": d.get("last_change_source")}
         if self._key == "active_exit_node":
-            return {"address": d.get("active_exit_node"), "primary": d.get("primary"), "primary_name": d.get("primary_name"), "secondary": d.get("secondary"), "secondary_name": d.get("secondary_name")}
+            return {"address": d.get("active_exit_node"), "primary": d.get("primary"), "primary_name": d.get("primary_name"), "secondary": d.get("secondary"), "secondary_name": d.get("secondary_name"), "active_rank": d.get("active_rank"), "nodes": d.get("node_list")}
         if self._key == "hw_switch":
             return {"matches_mode": d.get("hw_match")}
         return {}

@@ -1,0 +1,14 @@
+# Copy to /etc/tsem/notify.conf (chmod 600) to get a message when tsem changes state. See docs/rc/notifications.md.
+#
+# NOTIFY_TYPE: ntfy (https://ntfy.sh or your own server) or webhook (JSON POST: router, event, time, message)
+NOTIFY_TYPE=ntfy
+# Topic URL. Use a long random topic name on the public ntfy.sh, or a server on your tailnet (works even in BLOCKED).
+NOTIFY_URL=https://ntfy.sh/CHANGE-ME-to-a-long-random-topic
+# Shown in the message (letters, digits . _ -). Default: the router's host name.
+NOTIFY_NAME=my-router
+# Which events send a message: failover blocked recovered exit direct error  (default: failover blocked recovered)
+NOTIFY_EVENTS="failover blocked recovered"
+# Optional: file (mode 600) that holds an access token for a protected topic or webhook (sent as "Authorization: Bearer ...")
+# Optional second address, tried when NOTIFY_URL does not work (for example a server on your tailnet while the kill switch blocks the Internet):
+#NOTIFY_URL_FALLBACK=http://192.0.2.10:8098/CHANGE-ME-to-a-long-random-topic
+#NOTIFY_TOKEN_FILE=/etc/tsem/notify.token
