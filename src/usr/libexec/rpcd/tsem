@@ -12,11 +12,16 @@
 #   ubus call tsem status        read   controller state (JSON of `tsem status --json`)
 #   ubus call tsem config_get    read   exit nodes, auto-return, failover policy
 #   ubus call tsem nodes         read   exit-capable tailnet peers
+#   ubus call tsem report        read   {"days":1..90}: time per mode, failovers, BLOCKED episodes, restarts
+#   ubus call tsem leaktest      read   leak test of the router's own traffic and rules (takes up to ~20 s)
 #   ubus call tsem events        read   recent tsem log lines
 #   ubus call tsem diag          read   `tsem diag` output
-#   ubus call tsem set_mode      write  {"mode":"german|direct|blocked","source":"gui|ha|api","confirm":true (direct only)}
+#   ubus call tsem set_mode      write  {"mode":"german|direct|blocked","source":"gui|ha|api","confirm":true (direct only),"duration":"30m|1h|... (direct only: back after that time)"}
 #   ubus call tsem set_failover  write  {"mode":"auto|off","source":...}
 #   ubus call tsem failover_now  write  manual failover to the other exit node
+#   ubus call tsem notify_get    read   message settings (server names and whether a token exists; never the topic or a token)
+#   ubus call tsem notify_set    write  {"public":true | "server","topic", "fallback_server","fallback_topic","token","fallback_token","name","events"}
+#   ubus call tsem notify_test   write  sends a test message now
 #   ubus call tsem config_set    write  {"nodes","node_names","primary","primary_name","secondary","secondary_name","auto_return"}
 #
 # Every reply is one JSON object with "ok". On errors: "error" (message) and "code" (see below).
@@ -27,6 +32,9 @@ PATH=${PATH:+$PATH:}/usr/sbin:/usr/bin:/sbin:/bin; export PATH
 TSEM_BIN=${TSEM_BIN:-/usr/sbin/tsem}
 TSEM_LOGREAD=${TSEM_LOGREAD:-logread}
 TSEM_API_LINES=${TSEM_API_LINES:-120}
+TSEM_NOTIFY_BIN=${TSEM_NOTIFY_BIN:-/usr/sbin/tsem-notify}
+NOTIFY_TOKEN=${TSEM_NOTIFY_TOKEN:-/etc/tsem/notify.token}
+NOTIFY_TOKEN2=${TSEM_NOTIFY_TOKEN2:-/etc/tsem/notify.token2}
 
 TAB=$(printf '\t')
 # awk's gsub() treats backslashes in the replacement differently in gawk, mawk and busybox awk: escaping is done with sed
@@ -87,6 +95,21 @@ do_egress() {
 	case $_j in '{'*'}') printf '{"ok":true,"result":%s}\n' "$_j" ;; *) printf '{"ok":true,"result":{"ok":false,"reason":"unavailable"}}\n' ;; esac
 }
 
+do_report() {
+	_d=$(arg days); [ -n "$_d" ] || _d=7
+	case $_d in *[!0-9]* | 0*) reply_err invalid_argument "days: 1 to 90" ;; esac
+	[ ${#_d} -le 2 ] && [ "$_d" -le 90 ] || reply_err invalid_argument "days: 1 to 90"
+	_j=$("$TSEM_BIN" report --days "$_d" --json 2>/dev/null)
+	case $_j in '{'*'}') printf '{"ok":true,"result":%s}
+' "$_j" ;; *) reply_err backend "the report could not be made" ;; esac
+}
+
+do_leaktest() {
+	# the test exits non-zero on a FAIL but still prints its result: the result is what matters here
+	_j=$("$TSEM_BIN" leaktest --json 2>/dev/null)
+	case $_j in '{'*'}') printf '{"ok":true,"result":%s}\n' "$_j" ;; *) reply_err backend "the leak test could not run" ;; esac
+}
+
 do_events() {
 	_n=$TSEM_API_LINES
 	_ev=$($TSEM_LOGREAD -e tsem 2>/dev/null | tail -n "$_n" | lines_json)
@@ -112,7 +135,11 @@ do_set_mode() {
 		[ "$(arg confirm)" = 1 ] || [ "$(arg confirm)" = true ] ||
 			reply_err confirmation_required "DIRECT switches the kill switch off; send confirm=true"
 	fi
-	_o=$("$TSEM_BIN" set "$_m" --source "$SRC" 2>&1)
+	_d=$(arg duration)
+	case $_d in '' | [0-9]*) ;; *) reply_err invalid_argument "duration: for example 30m or 2h" ;; esac
+	case $_d in *[!0-9mh]*) reply_err invalid_argument "duration: for example 30m or 2h" ;; esac
+	[ -z "$_d" ] || [ "$_m" = direct ] || reply_err invalid_argument "a duration only makes sense for direct"
+	if [ -n "$_d" ]; then _o=$("$TSEM_BIN" set "$_m" --source "$SRC" --for "$_d" 2>&1); else _o=$("$TSEM_BIN" set "$_m" --source "$SRC" 2>&1); fi
 	write_reply "$_m" $? "$_o"
 }
 
@@ -133,6 +160,54 @@ do_failover_now() {
 		return 0
 	fi
 	write_reply failover_now "$_rc" "$_o"
+}
+
+do_notify_get() {
+	[ -x "$TSEM_NOTIFY_BIN" ] || reply_err backend "the message sender is not installed"
+	_j=$("$TSEM_NOTIFY_BIN" show --json 2>/dev/null)
+	case $_j in '{'*'}') printf '{"ok":true,"notify":%s}\n' "$_j" ;; *) printf '{"ok":true,"notify":{"configured":false}}\n' ;; esac
+}
+
+do_notify_set() {
+	[ -x "$TSEM_NOTIFY_BIN" ] || reply_err backend "the message sender is not installed"
+	# a field the form leaves empty keeps its current value (so the secret topic never has to be typed again)
+	_cf=${TSEM_NOTIFY_CONF:-/etc/tsem/notify.conf}
+	_cur() { sed -n "s/^$1=//p" "$_cf" 2>/dev/null | head -n1 | tr -d '"'; }
+	_cu=$(_cur NOTIFY_URL); _cf2=$(_cur NOTIFY_URL_FALLBACK)
+	_clr=$(arg clear_fallback)
+	_pub=$(arg public); _srv=$(arg server); _top=$(arg topic); _fsrv=$(arg fallback_server); _ftop=$(arg fallback_topic)
+	_tok=$(arg token); _ftok=$(arg fallback_token); _nm=$(arg name); _evs=$(arg events)
+	[ -n "$_pub$_srv$_top$_fsrv$_ftop$_tok$_ftok$_nm$_evs$_clr" ] || reply_err invalid_argument "nothing to change"
+	[ -n "$_nm" ] || _nm=$(_cur NOTIFY_NAME)
+	[ -n "$_evs" ] || _evs=$(_cur NOTIFY_EVENTS)
+	case $_pub in 1 | true) _pub=1 ;; *) _pub=0 ;; esac
+	if [ "$_pub" = 0 ]; then
+		[ -n "$_srv" ] || { [ -z "$_cu" ] || _srv=${_cu%/*}; }
+		[ -n "$_top" ] || { [ -z "$_cu" ] || _top=${_cu##*/}; }
+	fi
+	if [ -z "$_fsrv" ] && [ -n "$_cf2" ] && [ "$_clr" != 1 ] && [ "$_clr" != true ]; then _fsrv=${_cf2%/*}; [ -n "$_ftop" ] || _ftop=${_cf2##*/}; fi
+	[ "$_clr" != 1 ] && [ "$_clr" != true ] || _fsrv=
+	set --
+	if [ "$_pub" = 1 ]; then set -- --public; else [ -n "$_srv" ] || reply_err invalid_argument "give a server or choose the public one"; set -- --server "$_srv"; [ -z "$_top" ] || set -- "$@" --topic "$_top"; fi
+	[ -z "$_fsrv" ] || { set -- "$@" --fallback-server "$_fsrv"; [ -z "$_ftop" ] || set -- "$@" --fallback-topic "$_ftop"; }
+	[ -z "$_nm" ] || set -- "$@" --name "$_nm"
+	[ -z "$_evs" ] || set -- "$@" --events "$_evs"
+	# tokens go to their own files (mode 600) through standard input: never through a command line
+	if [ -n "$_tok" ]; then _o=$(printf '%s\n' "$_tok" | "$TSEM_NOTIFY_BIN" token "$NOTIFY_TOKEN" 2>&1) || reply_err invalid_argument "$(printf '%s' "$_o" | tail -n 1)"; fi
+	if [ -n "$_ftok" ]; then _o=$(printf '%s\n' "$_ftok" | "$TSEM_NOTIFY_BIN" token "$NOTIFY_TOKEN2" 2>&1) || reply_err invalid_argument "$(printf '%s' "$_o" | tail -n 1)"; fi
+	[ ! -f "$NOTIFY_TOKEN" ] || set -- "$@" --token-file "$NOTIFY_TOKEN"
+	[ ! -f "$NOTIFY_TOKEN2" ] || [ -z "$_fsrv" ] || set -- "$@" --fallback-token-file "$NOTIFY_TOKEN2"
+	_o=$("$TSEM_NOTIFY_BIN" setup "$@" 2>&1) || reply_err invalid_argument "$(printf '%s' "$_o" | head -n 1 | sed 's/^tsem-notify setup: //')"
+	_j=$("$TSEM_NOTIFY_BIN" show --json 2>/dev/null)
+	case $_j in '{'*'}') ;; *) _j='{"configured":false}' ;; esac
+	printf '{"ok":true,"requested":"notify_set","notify":%s}\n' "$_j"
+}
+
+do_notify_test() {
+	[ -x "$TSEM_NOTIFY_BIN" ] || reply_err backend "the message sender is not installed"
+	_o=$("$TSEM_NOTIFY_BIN" test 2>&1)
+	_rc=$?
+	printf '{"ok":%s,"requested":"notify_test","message":"%s"}\n' "$([ "$_rc" -eq 0 ] && echo true || echo false)" "$(printf '%s' "$_o" | tail -n 1 | jesc)"
 }
 
 do_config_set() {
@@ -161,10 +236,11 @@ do_config_set() {
 case ${1:-} in
 list)
 	cat <<'JSON'
-{"status":{},"config_get":{},"nodes":{},"subnets":{},"egress":{},"events":{},"diag":{},
-"set_mode":{"mode":"string","source":"string","confirm":true},
+{"status":{},"config_get":{},"nodes":{},"subnets":{},"egress":{},"leaktest":{},"report":{"days":"string"},"events":{},"diag":{},
+"set_mode":{"mode":"string","source":"string","confirm":true,"duration":"string"},
 "set_failover":{"mode":"string","source":"string"},
-"failover_now":{},
+"failover_now":{},"notify_get":{},"notify_test":{},
+"notify_set":{"public":true,"server":"string","topic":"string","fallback_server":"string","fallback_topic":"string","token":"string","fallback_token":"string","clear_fallback":true,"name":"string","events":"string"},
 "config_set":{"nodes":"string","node_names":"string","primary":"string","primary_name":"string","secondary":"string","secondary_name":"string","auto_return":true,"mode_label":"string","allow_subnets4":"string","hw_at_boot":"string"}}
 JSON
 	;;
@@ -178,12 +254,17 @@ call)
 	nodes) do_nodes ;;
 	subnets) do_subnets ;;
 	egress) do_egress ;;
+	leaktest) do_leaktest ;;
+	report) do_report ;;
 	events) do_events ;;
 	diag) do_diag ;;
 	set_mode) do_set_mode ;;
 	set_failover) do_set_failover ;;
 	failover_now) do_failover_now ;;
 	config_set) do_config_set ;;
+	notify_get) do_notify_get ;;
+	notify_set) do_notify_set ;;
+	notify_test) do_notify_test ;;
 	*) reply_err not_found "unknown method" ;;
 	esac
 	;;

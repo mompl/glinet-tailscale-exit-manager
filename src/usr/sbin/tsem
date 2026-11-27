@@ -14,6 +14,8 @@
 #   tsem verify-nodes                                    read-only: are the configured exit nodes the intended, approved, online nodes?
 #   tsem config get [--json] | set KEY=VALUE...          exit nodes and auto-return (validated, atomic; the only config writer for GUI/API)
 #   tsem egress [--json] [--refresh]                     public address seen from outside (asks myip.wtf, on demand)
+#   tsem report [--days N] [--json] [--notify]           how long was the router in which mode (last N days, default 7), failovers, BLOCKED episodes, restarts
+#   tsem leaktest [--json]                               read-only: does the router's own traffic leave only the way it should? (address, IPv6, DNS, kill switch)
 #   tsem nodes [--json]                                  read-only: exit-capable tailnet peers and their role
 #   tsem backup [FILE] | restore FILE                    save / restore the settings (tsem.conf, notify.conf, mqtt.conf; never the mode or secrets)
 #   tsem deps                                            reinstall packages setup installed and a firmware upgrade removed (needs Internet)
@@ -180,6 +182,107 @@ _probe_round() { # needs _pr_cur (a rank or none); sets SIG_<rank> PR_K_<rank> P
 
 # v1.1: optional message (ntfy/webhook), called AFTER the change is applied so that the text knows the active exit node. Detached: the
 # controller never waits for it. Without a config file nothing is started.
+# ---- history and the weekly report (v1.2). The history is a short file of state changes ("epoch|STATE"), a few lines per week, written only when
+# the state changes; tmpfs-only data would be lost at every reboot of a mobile router. "DOWN" is the last time the controller was seen
+# alive before a restart (written once an hour), "BOOT" the first tick after it: the gap in between is time the router was off, not time
+# in a mode. Entries from before the clock was set (before 2023) are ignored.
+_hist_file() { echo "$TSEM_STATE_DIR/history"; }
+_hist_trim() { [ "$(wc -l <"$(_hist_file)" 2>/dev/null || echo 0)" -le 600 ] || { tail -n 400 "$(_hist_file)" >"$(_hist_file).tmp" && mv -f "$(_hist_file).tmp" "$(_hist_file)"; }; }
+_boot_mark() {
+	[ ! -e "$TSEM_RUN_DIR/booted" ] || return 0
+	_bm_t=$(now)
+	is_epoch "$_bm_t" && [ "$_bm_t" -ge 1700000000 ] || return 0
+	mkdir -p "$TSEM_STATE_DIR" "$TSEM_RUN_DIR" 2>/dev/null
+	: >"$TSEM_RUN_DIR/booted"
+	_bm_a=''; read -r _bm_a <"$TSEM_STATE_DIR/history.alive" 2>/dev/null || _bm_a=''
+	if is_epoch "$_bm_a" && [ "$_bm_a" -lt "$_bm_t" ]; then printf '%s|DOWN\n' "$_bm_a" >>"$(_hist_file)"; fi
+	printf '%s|BOOT\n' "$_bm_t" >>"$(_hist_file)"
+	printf '%s\n' "$_bm_t" >"$TSEM_STATE_DIR/history.alive" 2>/dev/null
+}
+_hist_note() { # old new: the state after this action; the first call after a boot records the state in any case
+	_hn_t=$(now)
+	is_epoch "$_hn_t" && [ "$_hn_t" -ge 1700000000 ] || return 0
+	_boot_mark
+	if [ ! -e "$TSEM_RUN_DIR/hist_started" ]; then
+		: >"$TSEM_RUN_DIR/hist_started" 2>/dev/null
+	elif [ "$1" = "$2" ]; then
+		return 0
+	fi
+	printf '%s|%s\n' "$_hn_t" "$2" >>"$(_hist_file)" && _hist_trim
+}
+# once an hour: remember that the controller is alive; once a week (only when the message setting lists the event "report"): send the report
+_hourly_tick() {
+	_ht_n=$(now)
+	_ht_l=''; read -r _ht_l <"$TSEM_RUN_DIR/hourly" 2>/dev/null || _ht_l=''
+	if is_epoch "$_ht_l" && [ "$_ht_n" -ge "$_ht_l" ] && [ $((_ht_n - _ht_l)) -lt 3600 ]; then return 0; fi
+	is_epoch "$_ht_n" && [ "$_ht_n" -ge 1700000000 ] || return 0
+	_boot_mark
+	mkdir -p "$TSEM_RUN_DIR" 2>/dev/null
+	printf '%s\n' "$_ht_n" >"$TSEM_RUN_DIR/hourly" 2>/dev/null
+	printf '%s\n' "$_ht_n" >"$TSEM_STATE_DIR/history.alive" 2>/dev/null
+	_ht_c=${TSEM_NOTIFY_CONF:-/etc/tsem/notify.conf}
+	[ -r "$_ht_c" ] && grep -q '^NOTIFY_EVENTS=.*report' "$_ht_c" 2>/dev/null || return 0
+	_ht_r=''; read -r _ht_r <"$TSEM_STATE_DIR/report_last" 2>/dev/null || _ht_r=''
+	if ! is_epoch "$_ht_r" || [ "$_ht_r" -gt "$_ht_n" ]; then printf '%s\n' "$_ht_n" >"$TSEM_STATE_DIR/report_last" 2>/dev/null; return 0; fi
+	[ $((_ht_n - _ht_r)) -ge 604800 ] || return 0
+	printf '%s\n' "$_ht_n" >"$TSEM_STATE_DIR/report_last" 2>/dev/null
+	( cmd_report --notify >/dev/null 2>&1 9>&- & )
+}
+
+# ---- temporary DIRECT ("one hour, then back"). The timer is its own small file, bound to the sequence number of the DIRECT intent it was
+# started with: any later action of the user (a new tsem set, the switch, the GUI) changes the sequence, so the timer is void and can never
+# switch anything back by surprise. The controller itself brings the router back (tick): no GUI, no Home Assistant needed. When anything is
+# unclear (damaged file, the clock went backwards, the return mode cannot be applied) the answer is the PROTECTED direction.
+dt_file() { echo "$TSEM_STATE_DIR/direct_until"; }
+dt_default_return() { if [ -n "$TSEM_PRIMARY" ]; then echo german; else echo blocked; fi; }
+dt_parse() { # 30m | 2h | 90 (minutes) -> seconds, 60 s .. 24 h
+	case $1 in
+	*h) _dp_n=${1%h}; _dp_m=3600 ;;
+	*m) _dp_n=${1%m}; _dp_m=60 ;;
+	*) _dp_n=$1; _dp_m=60 ;;
+	esac
+	case $_dp_n in '' | *[!0-9]* | 0*) return 1 ;; esac
+	[ ${#_dp_n} -le 5 ] || return 1
+	_dp_s=$((_dp_n * _dp_m))
+	[ "$_dp_s" -ge 60 ] && [ "$_dp_s" -le 86400 ] || return 1
+	echo "$_dp_s"
+}
+# dt_read: needs a current intent_read. Sets DT_UNTIL DT_RET DT_TS. rc 0 = a valid timer that belongs to the CURRENT DIRECT intent.
+dt_read() {
+	DT_UNTIL=0 DT_RET='' DT_TS=0
+	_dt_f=$(dt_file)
+	[ -r "$_dt_f" ] || return 1
+	_dt_s=''
+	while IFS='=' read -r _dt_k _dt_v; do
+		case $_dt_k in until) DT_UNTIL=$_dt_v ;; return) DT_RET=$_dt_v ;; ts) DT_TS=$_dt_v ;; seq) _dt_s=$_dt_v ;; esac
+	done <"$_dt_f"
+	is_epoch "$DT_UNTIL" && is_epoch "$DT_TS" && is_uint "$_dt_s" || return 1
+	case $DT_RET in german | blocked) ;; *) return 1 ;; esac
+	[ "$I_MODE" = direct ] && [ "$_dt_s" = "$I_SEQ" ] || return 1
+	return 0
+}
+dt_write() { # until return seq
+	mkdir -p "$TSEM_STATE_DIR" || return 1
+	_dtw=$TSEM_STATE_DIR/.direct_until.$$
+	( umask 077; printf 'until=%s\nreturn=%s\nts=%s\nseq=%s\n' "$1" "$2" "$(now)" "$3" >"$_dtw" ) && mv -f "$_dtw" "$(dt_file)" || { rm -f "$_dtw"; return 1; }
+}
+# called by tick while the intent is DIRECT; rc 0 = the timer ran out and the router was sent back (the tick ends here)
+_dt_tick() {
+	dt_read || return 1
+	_dtn=$(now)
+	if [ "$_dtn" -ge "$DT_UNTIL" ] || [ "$_dtn" -lt "$DT_TS" ]; then
+		log "temporary DIRECT is over (or the clock went back): back to $DT_RET"
+		( cmd_set "$DT_RET" --source timer --no-wait ) || true
+		lock_acquire; intent_read; lock_release
+		if [ "$I_MODE" = direct ]; then
+			log "could not return to $DT_RET: closing the router (BLOCKED) instead"
+			( cmd_set blocked --source timer --no-wait ) || true
+		fi
+		return 0
+	fi
+	return 1
+}
+
 _notify_change() { # old new
 	if [ -r "${TSEM_NOTIFY_CONF:-/etc/tsem/notify.conf}" ] && [ -x "${TSEM_NOTIFY_BIN:-/usr/sbin/tsem-notify}" ] && { [ "$1" != "$2" ] || [ -s "$TSEM_RUN_DIR/notify.queue" ]; }; then
 		( "${TSEM_NOTIFY_BIN:-/usr/sbin/tsem-notify}" tick "$1" "$2" >/dev/null 2>&1 9>&- & )
@@ -197,6 +300,7 @@ cmd_tick() {
 	fo_load
 	_pr_cur=$FO_CUR
 	lock_release
+	_hourly_tick
 
 	if [ "$_irc" -ne 0 ]; then
 		log "intent missing/invalid: fail closed (BLOCKED)"
@@ -207,6 +311,7 @@ cmd_tick() {
 		return "$_rc"
 	fi
 
+	if [ "$_mode" = direct ] && _dt_tick; then return 0; fi
 	if [ "$_mode" = direct ]; then
 		lock_acquire
 		intent_read
@@ -221,6 +326,7 @@ cmd_tick() {
 			_rc=0
 		fi
 		lock_release
+		_hist_note DISABLED DISABLED # only the first call after a boot writes the state: a router that stays in DIRECT must show up in the report too
 		return "$_rc"
 	fi
 
@@ -239,6 +345,7 @@ cmd_tick() {
 			_rc=0
 		fi
 		lock_release
+		_hist_note BLOCKED BLOCKED
 		return "$_rc"
 	fi
 
@@ -279,6 +386,7 @@ cmd_tick() {
 	fi
 	fo_save
 	lock_release
+	_hist_note "$_old" "$_new"
 	_notify_change "$_old" "$_new"
 	[ "$FO_FORCE_REFUSED" = 0 ] || return 4
 	return "$_rc"
@@ -300,11 +408,11 @@ _wait_active() {
 }
 
 cmd_set() {
-	[ $# -ge 1 ] || die "usage: tsem set direct|exit|blocked (exit = german) [--source NAME] [--no-wait]"
+	[ $# -ge 1 ] || die "usage: tsem set direct|exit|blocked (exit = german) [--source NAME] [--no-wait] [--for 30m|1h|90 (direct only: back after that time)]"
 	_mode=$1
 	[ "$_mode" != exit ] || _mode=german
 	shift
-	_src=cli _wait=$TSEM_SET_TICKS
+	_src=cli _wait=$TSEM_SET_TICKS _for=0
 	while [ $# -gt 0 ]; do
 		case $1 in
 		--source)
@@ -313,10 +421,16 @@ cmd_set() {
 			shift 2
 			;;
 		--no-wait) _wait=0; shift ;;
+		--for)
+			[ $# -ge 2 ] || die "--for needs a value, for example 30m or 1h"
+			_for=$(dt_parse "$2") || die "--for: between 1 minute and 24 hours, for example 30m, 2h or 90 (minutes)"
+			shift 2
+			;;
 		*) die "unknown option: $1" ;;
 		esac
 	done
 	case $_mode in direct | german | blocked) ;; *) die "invalid mode: $_mode" ;; esac
+	[ "$_for" -eq 0 ] || [ "$_mode" = direct ] || die "--for only makes sense with direct"
 	case $_src in '' | *[!a-z0-9_-]*) die "invalid source name" ;; esac
 	if [ "$_mode" = german ] && [ -z "$TSEM_PRIMARY" ]; then
 		DIE_RC=2 die "TSEM_PRIMARY (primary exit node) is not configured"
@@ -332,9 +446,26 @@ cmd_set() {
 	if [ "$_irc" -eq 0 ]; then fo_load; _pst=$(fo_state_name "$I_MODE"); fi
 	if [ "$_irc" -eq 0 ] && [ "$I_MODE" = "$_mode" ]; then
 		log "already in $_mode (no change)"
+		if [ "$_mode" = direct ]; then
+			# DIRECT again: with --for the timer is (re)started, without it a running timer is removed and DIRECT stays
+			if [ "$_for" -gt 0 ]; then
+				dt_read && _dtr=$DT_RET || _dtr=$(dt_default_return)
+				dt_write "$(($(now) + _for))" "$_dtr" "$I_SEQ" && log "temporary DIRECT for $_for s, then back to $_dtr" || echo "tsem: could not write the timer: DIRECT stays until you switch back" >&2
+			elif dt_read; then
+				rm -f "$(dt_file)"
+				log "the DIRECT timer was removed: DIRECT stays until you change it"
+			fi
+		fi
 	else
+		_dtr=$(dt_default_return)
+		case $_irc:$I_MODE in 0:german | 0:blocked) _dtr=$I_MODE ;; esac
 		intent_write "$_mode" "$_fo" "$_src" || die "cannot write intent"
 		_changed=1
+		if [ "$_mode" = direct ] && [ "$_for" -gt 0 ]; then
+			dt_write "$(($(now) + _for))" "$_dtr" "$((I_SEQ + 1))" && log "temporary DIRECT for $_for s, then back to $_dtr" || echo "tsem: could not write the timer: DIRECT stays until you switch back" >&2
+		else
+			rm -f "$(dt_file)"
+		fi
 		fo_reset
 		case $_mode in
 		direct) CONVERGE_CLEAR_ALL=1; converge open '' || _rc=1; CONVERGE_CLEAR_ALL=0 ;;
@@ -349,7 +480,7 @@ cmd_set() {
 	log "set $_mode requested by source=$_src changed=$_changed apply_rc=$_rc wait=$_wait"
 	# a message for the modes that do not go through a tick; EXIT is announced when it is really active (tick)
 	if [ "$_changed" -eq 1 ] && [ -n "$_pst" ]; then
-		case $_mode in direct) _notify_change "$_pst" DISABLED ;; blocked) _notify_change "$_pst" BLOCKED ;; esac
+		case $_mode in direct) _hist_note "$_pst" DISABLED; _notify_change "$_pst" DISABLED ;; blocked) _hist_note "$_pst" BLOCKED; _notify_change "$_pst" BLOCKED ;; esac
 	fi
 
 	if [ "$_mode" = german ] && [ "$_changed" -eq 1 ] && [ "$_wait" -eq 1 ]; then
@@ -486,6 +617,8 @@ cmd_status() {
 	if [ "$_irc" -ne 0 ]; then _state=BLOCKED
 	else _state=$(fo_state_name "$I_MODE"); fi
 	_gwant=$(fo_guard_for "$_state")
+	_du=0 _dr=''
+	if dt_read; then _du=$DT_UNTIL _dr=$DT_RET; fi
 	_guard=$(be_guard_get)
 	_exit=$(be_exit_get | tr -cd 'A-Za-z0-9.:_-')
 	case $_guard in german | blocked) _ks=true ;; *) _ks=false ;; esac
@@ -575,15 +708,15 @@ cmd_status() {
 		fi
 	fi
 	if [ "$_json" -eq 1 ]; then
-		printf '{"version":"%s","intent":"%s","intent_reason":"%s","mode":"%s","state":"%s","desired_guard":"%s","guard":"%s","kill_switch_active":%s,"leak_risk":%s,"exit_node":"%s","active_exit":"%s","primary":"%s","primary_ok":"%s","primary_probe":"%s","secondary":"%s","secondary_ok":"%s","secondary_probe":"%s","failover":"%s","dns":"%s","seq":%s,"source":"%s","last_check":%s,"error":"%s","boot_failed":"%s","hw_state":"%s","hw_match":"%s","auto_return":%s,"last_change":%s,"ipv6_protection":"%s","dns_protection":"%s","hw_source":"%s","hw_event_ts":%s,"return_wait":"%s","mode_label":"%s","active_exit_name":"%s","primary_name":"%s","secondary_name":"%s","nodes":%s,"active_rank":%s,"node_list":[%s]}\n' \
+		printf '{"version":"%s","intent":"%s","intent_reason":"%s","mode":"%s","state":"%s","desired_guard":"%s","guard":"%s","kill_switch_active":%s,"leak_risk":%s,"exit_node":"%s","active_exit":"%s","primary":"%s","primary_ok":"%s","primary_probe":"%s","secondary":"%s","secondary_ok":"%s","secondary_probe":"%s","failover":"%s","dns":"%s","seq":%s,"source":"%s","last_check":%s,"error":"%s","boot_failed":"%s","hw_state":"%s","hw_match":"%s","auto_return":%s,"last_change":%s,"ipv6_protection":"%s","dns_protection":"%s","hw_source":"%s","hw_event_ts":%s,"return_wait":"%s","mode_label":"%s","active_exit_name":"%s","primary_name":"%s","secondary_name":"%s","nodes":%s,"active_rank":%s,"node_list":[%s],"direct_until":%s,"direct_return":"%s"}\n' \
 			"$TSEM_VERSION" "$_intent" "$I_WHY" "$_desired" "$_state" "$_gwant" "$_guard" "$_ks" "$_leak" "$_exit" "$_active" \
 			"$_p" "$(_fo_v FO_PS 1)" "$(_fo_v FO_PK 1)" "$_s" "$(_fo_v FO_PS 2)" "$(_fo_v FO_PK 2)" "${I_FAILOVER:-auto}" "$FO_DNS" "${I_SEQ:-0}" "${I_SRC:-}" \
-			"$FO_CHK" "$FO_ERR" "$_bootfail" "$_hw" "$_hwm" "$_ar" "${I_TS:-0}" "$_v6" "$_dnsr" "$_hws" "${_hwt:-0}" "$_rw" "$TSEM_MODE_LABEL" "$_aname" "$_pname" "$_sname" "${TSEM_NODE_COUNT:-0}" "$_arank" "$_nl_json"
+			"$FO_CHK" "$FO_ERR" "$_bootfail" "$_hw" "$_hwm" "$_ar" "${I_TS:-0}" "$_v6" "$_dnsr" "$_hws" "${_hwt:-0}" "$_rw" "$TSEM_MODE_LABEL" "$_aname" "$_pname" "$_sname" "${TSEM_NODE_COUNT:-0}" "$_arank" "$_nl_json" "$_du" "$_dr"
 	else
-		printf 'version=%s\nintent=%s\nintent_reason=%s\nmode=%s\nstate=%s\ndesired_guard=%s\nguard=%s\nkill_switch_active=%s\nleak_risk=%s\nexit_node=%s\nactive_exit=%s\nprimary=%s\nprimary_ok=%s\nprimary_probe=%s\nsecondary=%s\nsecondary_ok=%s\nsecondary_probe=%s\nfailover=%s\ndns=%s\nseq=%s\nsource=%s\nlast_check=%s\nerror=%s\nboot_failed=%s\nhw_state=%s\nhw_match=%s\nauto_return=%s\nlast_change=%s\nipv6_protection=%s\ndns_protection=%s\nhw_source=%s\nhw_event_ts=%s\nreturn_wait=%s\nmode_label=%s\nactive_exit_name=%s\nprimary_name=%s\nsecondary_name=%s\nnodes=%s\nactive_rank=%s\n%s' \
+		printf 'version=%s\nintent=%s\nintent_reason=%s\nmode=%s\nstate=%s\ndesired_guard=%s\nguard=%s\nkill_switch_active=%s\nleak_risk=%s\nexit_node=%s\nactive_exit=%s\nprimary=%s\nprimary_ok=%s\nprimary_probe=%s\nsecondary=%s\nsecondary_ok=%s\nsecondary_probe=%s\nfailover=%s\ndns=%s\nseq=%s\nsource=%s\nlast_check=%s\nerror=%s\nboot_failed=%s\nhw_state=%s\nhw_match=%s\nauto_return=%s\nlast_change=%s\nipv6_protection=%s\ndns_protection=%s\nhw_source=%s\nhw_event_ts=%s\nreturn_wait=%s\nmode_label=%s\nactive_exit_name=%s\nprimary_name=%s\nsecondary_name=%s\nnodes=%s\nactive_rank=%s\ndirect_until=%s\ndirect_return=%s\n%s' \
 			"$TSEM_VERSION" "$_intent" "$I_WHY" "$_desired" "$_state" "$_gwant" "$_guard" "$_ks" "$_leak" "$_exit" "$_active" \
 			"$_p" "$(_fo_v FO_PS 1)" "$(_fo_v FO_PK 1)" "$_s" "$(_fo_v FO_PS 2)" "$(_fo_v FO_PK 2)" "${I_FAILOVER:-auto}" "$FO_DNS" "${I_SEQ:-0}" "${I_SRC:-}" \
-			"$FO_CHK" "$FO_ERR" "$_bootfail" "$_hw" "$_hwm" "$_ar" "${I_TS:-0}" "$_v6" "$_dnsr" "$_hws" "${_hwt:-0}" "$_rw" "$TSEM_MODE_LABEL" "$_aname" "$_pname" "$_sname" "${TSEM_NODE_COUNT:-0}" "$_arank" "$_nl_txt"
+			"$FO_CHK" "$FO_ERR" "$_bootfail" "$_hw" "$_hwm" "$_ar" "${I_TS:-0}" "$_v6" "$_dnsr" "$_hws" "${_hwt:-0}" "$_rw" "$TSEM_MODE_LABEL" "$_aname" "$_pname" "$_sname" "${TSEM_NODE_COUNT:-0}" "$_arank" "$_du" "$_dr" "$_nl_txt"
 	fi
 	[ "$_leak" = false ]
 }
@@ -700,7 +833,8 @@ cmd_selftest() {
 	# iproute2/busybox `ip rule help` usually does NOT list the actions, so grepping it proves nothing
 	# (that was an RC2 false warning). Capability is proven when the guard is installed: tsem tries
 	# prohibit, then unreachable, then blackhole (all drop, none routes) and VERIFIES the rule by reading it back.
-	for _f in /etc/resolv.conf /tmp/resolv.conf.auto; do
+	# the second and third file hold the UPSTREAM resolvers of the router's own dnsmasq (resolv.conf itself only shows 127.0.0.1 then)
+	for _f in /etc/resolv.conf /tmp/resolv.conf.auto /tmp/resolv.conf.d/resolv.conf.auto; do
 		[ -r "$_f" ] || continue
 		for _ns in $(sed -n 's/^nameserver[[:space:]]*\([^[:space:]]*\).*/\1/p' "$_f"); do
 			case $(dns_class "$_ns") in
@@ -708,7 +842,7 @@ cmd_selftest() {
 			public) _st_pass "dns-resolver" "$_f: $_ns public: follows table 52/exit node in german mode; underlay DNS is rejected by TSEM_OUT" ;;
 			unspecified) if dns_unspec_local; then _st_pass "dns-resolver" "$_f: $_ns (unspecified): the kernel routes it to the local host (dev lo), no path to an external resolver"
 			else _st_warn "dns-resolver" "$_f: $_ns (unspecified address) could not be shown to be local; behaviour UNVERIFIED, see 'tsem diag' and the active DNS test of the acceptance run"; fi ;;
-			private) _st_warn "dns-resolver" "$_f: $_ns (private): reachable only via WAN/LAN unless a subnet route exists; rejected from the router in german mode" ;;
+			private) _st_warn "dns-resolver" "$_f: $_ns (private): reachable only via WAN/LAN unless a subnet route exists; rejected from the router in german mode: if the router's resolver uses it as upstream, names do not resolve while protected (found on a travel router behind another router): use a public upstream, see docs/rc/dns-ipv6.md" ;;
 			esac
 		done
 	done
@@ -1126,6 +1260,8 @@ cmd_egress() {
 			_eg_out=$(printf '{"ok":true,"ip":"%s","location":"%s","isp":"%s","country":"%s","country_code":"%s","hostname":"%s","tor":%s,"source":"myip.wtf","ts":%s}' \
 				"$_eg_ip" "$(_eg_get YourFuckingLocation)" "$(_eg_get YourFuckingISP)" "$(_eg_get YourFuckingCountry)" "$(_eg_get YourFuckingCountryCode)" "$(_eg_get YourFuckingHostname)" "$_eg_tor" "$_eg_now")
 			mkdir -p "$TSEM_RUN_DIR" 2>/dev/null; printf '%s\n' "$_eg_out" >"$_eg_f"
+			# while the kill switch is open the address is the router's own: keep it, the leak test compares the exit address with it
+			if [ "$(be_guard_get 2>/dev/null)" = open ]; then ( umask 077; printf '%s\n' "$_eg_ip" >"$TSEM_STATE_DIR/egress_direct.new" ) 2>/dev/null && mv -f "$TSEM_STATE_DIR/egress_direct.new" "$TSEM_STATE_DIR/egress_direct" 2>/dev/null; fi
 		else
 			_eg_out='{"ok":false,"reason":"unreachable"}'
 		fi
@@ -1138,6 +1274,150 @@ cmd_egress() {
 		esac
 	fi
 	return 0
+}
+
+# ---------------------------------------------------------------- report (v1.2)
+cmd_report() {
+	_rp_days=7 _rp_json=0 _rp_notify=0
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--json) _rp_json=1; shift ;;
+		--notify) _rp_notify=1; shift ;;
+		--days)
+			[ $# -ge 2 ] || die "--days needs a number (1 to 90)"
+			case $2 in '' | *[!0-9]* | 0*) die "--days: a number from 1 to 90" ;; esac
+			[ ${#2} -le 2 ] && [ "$2" -le 90 ] || die "--days: a number from 1 to 90"
+			_rp_days=$2; shift 2 ;;
+		*) die "usage: tsem report [--days N] [--json] [--notify]" ;;
+		esac
+	done
+	_rp_now=$(now)
+	_rp_start=$((_rp_now - _rp_days * 86400))
+	_rp_h=$(_hist_file)
+	_rp_a=$(awk -F'|' -v now="$_rp_now" -v start="$_rp_start" '
+	function acct(st, a, b,   x) { if (a < start) a = start; if (b > now) b = now; if (b <= a) return; x = b - a
+		if (st == "PRIMARY_ACTIVE") ex += x; else if (st == "SECONDARY_ACTIVE") bk += x; else if (st == "BLOCKED") { bl += x; bl_cur += x } else if (st == "DISABLED") dr += x; else ot += x }
+	function close_seg(t) { if (cur != "") { acct(cur, cs, t); if (cur == "BLOCKED") { seg = t - (cs < start ? start : cs); if (seg > lb) lb = seg } } cur = "" }
+	$1 + 0 < 1700000000 { next }
+	$2 == "BOOT" { if (down > 0 && $1 >= start) { a = down; if (a < start) a = start; if ($1 > a) off += ($1 > now ? now : $1) - a } down = 0; if ($1 >= start) rs++; next }
+	$2 == "DOWN" { close_seg($1); down = $1; next }
+	{ close_seg($1); cur = $2; cs = $1
+	  if ($1 >= start) { if (cur == "SECONDARY_ACTIVE") fo++; else if (cur == "BLOCKED") be++; else if (cur == "DISABLED") de++ } }
+	END { close_seg(now); if (down > 0 && down >= start) { off += now - down }
+	  printf "%d %d %d %d %d %d %d %d %d %d %d %d\n", ex, bk, bl, dr, ot, off, fo, be, lb, de, rs, 0 }' "$_rp_h" 2>/dev/null)
+	[ -n "$_rp_a" ] || _rp_a="0 0 0 0 0 0 0 0 0 0 0 0"
+	# shellcheck disable=SC2086
+	set -- $_rp_a
+	_rp_ex=$1 _rp_bk=$2 _rp_bl=$3 _rp_dr=$4 _rp_ot=$5 _rp_off=$6 _rp_fo=$7 _rp_be=$8 _rp_lb=$9 _rp_de=${10} _rp_rs=${11}
+	_rp_tr=$((_rp_ex + _rp_bk + _rp_bl + _rp_dr + _rp_ot))
+	_rp_fmt() { _f_s=$1; _f_d=$((_f_s / 86400)); _f_h=$(((_f_s % 86400) / 3600)); _f_m=$(((_f_s % 3600) / 60))
+		if [ "$_f_d" -gt 0 ]; then printf '%sd %sh %sm' "$_f_d" "$_f_h" "$_f_m"; elif [ "$_f_h" -gt 0 ]; then printf '%sh %sm' "$_f_h" "$_f_m"; elif [ "$_f_m" -gt 0 ]; then printf '%sm' "$_f_m"; else printf '%ss' "$_f_s"; fi; }
+	_rp_pct() { if [ "$_rp_tr" -gt 0 ]; then echo $(($1 * 100 / _rp_tr)); else echo 0; fi; }
+	if [ "$_rp_notify" -eq 1 ]; then
+		_rp_lab=${TSEM_MODE_LABEL:-EXIT}
+		_rp_msg="week report ($_rp_days d): $_rp_lab $(_rp_pct "$_rp_ex")%"
+		[ "$_rp_bk" -eq 0 ] || _rp_msg="$_rp_msg, backup node $(_rp_fmt "$_rp_bk")"
+		[ "$_rp_bl" -eq 0 ] || _rp_msg="$_rp_msg, BLOCKED $(_rp_fmt "$_rp_bl") ($_rp_be x)"
+		[ "$_rp_dr" -eq 0 ] || _rp_msg="$_rp_msg, DIRECT $(_rp_fmt "$_rp_dr") ($_rp_de x)"
+		_rp_msg="$_rp_msg, $_rp_fo failover(s), $_rp_rs restart(s)"
+		[ "$_rp_tr" -gt 0 ] || _rp_msg="week report ($_rp_days d): not enough data yet"
+		"${TSEM_NOTIFY_BIN:-/usr/sbin/tsem-notify}" report "$_rp_msg"
+		return $?
+	fi
+	if [ "$_rp_json" -eq 1 ]; then
+		printf '{"days":%s,"since":%s,"tracked":%s,"seconds":{"exit":%s,"backup":%s,"blocked":%s,"direct":%s,"other":%s,"off":%s},"failovers":%s,"blocked_episodes":%s,"longest_blocked":%s,"direct_episodes":%s,"restarts":%s}\n' \
+			"$_rp_days" "$_rp_start" "$_rp_tr" "$_rp_ex" "$_rp_bk" "$_rp_bl" "$_rp_dr" "$_rp_ot" "$_rp_off" "$_rp_fo" "$_rp_be" "$_rp_lb" "$_rp_de" "$_rp_rs"
+		return 0
+	fi
+	echo "tsem report: the last $_rp_days day(s), measured while the router was running ($(_rp_fmt "$_rp_tr"))"
+	[ "$_rp_tr" -gt 0 ] || { echo "not enough data yet (the history starts with the first state change after this version was installed)"; return 0; }
+	printf '%-18s %-12s %s%%\n' "${TSEM_MODE_LABEL:-EXIT}" "$(_rp_fmt "$_rp_ex")" "$(_rp_pct "$_rp_ex")"
+	printf '%-18s %-12s %s%%\n' "backup exit node" "$(_rp_fmt "$_rp_bk")" "$(_rp_pct "$_rp_bk")"
+	printf '%-18s %-12s %s%% (%s time(s), longest %s)\n' "BLOCKED" "$(_rp_fmt "$_rp_bl")" "$(_rp_pct "$_rp_bl")" "$_rp_be" "$(_rp_fmt "$_rp_lb")"
+	printf '%-18s %-12s %s%% (%s time(s))\n' "DIRECT" "$(_rp_fmt "$_rp_dr")" "$(_rp_pct "$_rp_dr")" "$_rp_de"
+	[ "$_rp_ot" -eq 0 ] || printf '%-18s %-12s\n' "other (connecting)" "$(_rp_fmt "$_rp_ot")"
+	printf '%-18s %s\n' "router was off" "$(_rp_fmt "$_rp_off")"
+	echo "failovers: $_rp_fo   restarts: $_rp_rs"
+}
+
+# ---------------------------------------------------------------- leak test (v1.2)
+# What the router can measure about ITSELF: its own traffic and its own settings. Devices behind the router are covered by the firewall
+# rules this test checks, but only a device itself can show what it sees (open any "what is my IP" page on it).
+# Result per check: PASS, WARN, FAIL or INFO. Exit status 0 = no FAIL.
+_lt_add() { # status name text
+	_lt_n=$((_lt_n + 1))
+	_lt_txt="$_lt_txt$1|$2|$3
+"
+	case $1 in FAIL) _lt_fail=$((_lt_fail + 1)) ;; WARN) _lt_warn=$((_lt_warn + 1)) ;; esac
+}
+cmd_leaktest() {
+	_lt_json=0; [ "${1:-}" = "--json" ] && _lt_json=1
+	_lt_n=0 _lt_fail=0 _lt_warn=0 _lt_txt=''
+	_lt_st=$(cmd_status 2>/dev/null || true)
+	_lt_v() { printf '%s\n' "$_lt_st" | sed -n "s/^$1=//p" | head -n1; }
+	_lt_mode=$(_lt_v mode); _lt_state=$(_lt_v state); _lt_ks=$(_lt_v kill_switch_active); _lt_leak=$(_lt_v leak_risk)
+	_lt_v6=$(_lt_v ipv6_protection); _lt_dns=$(_lt_v dns_protection)
+	_lt_curl=${TSEM_CURL:-curl}
+	_lt_url=${TSEM_EGRESS_URL:-https://myip.wtf/json}
+	_lt_ipof() { sed -n 's/.*"YourFuckingIPAddress": *"\([^"]*\)".*/\1/p' | head -n1 | tr -cd '0-9A-Fa-f.:'; }
+	case $_lt_mode in
+	direct)
+		_lt_add INFO kill-switch "DIRECT: the kill switch is off on purpose, the router and its devices use the normal internet"
+		_lt_r=$(cmd_egress --json --refresh 2>/dev/null); _lt_ip=$(printf '%s' "$_lt_r" | sed -n 's/.*"ip":"\([^"]*\)".*/\1/p')
+		if [ -n "$_lt_ip" ]; then _lt_add INFO address "your own public address is $_lt_ip (kept to compare with the exit address later)"
+		else _lt_add WARN address "the public address could not be determined (no Internet path?)"; fi
+		;;
+	german | blocked)
+		if [ "$_lt_ks" = true ] && [ "$_lt_leak" = false ]; then _lt_add PASS kill-switch "the kill switch is closed and consistent with the mode ($_lt_mode)"
+		else _lt_add FAIL kill-switch "the kill switch is NOT consistent with the mode $_lt_mode (kill_switch_active=$_lt_ks leak_risk=$_lt_leak): run tsem set $_lt_mode again"; fi
+		case $_lt_v6 in guarded) _lt_add PASS ipv6 "IPv6 is guarded" ;; *) _lt_add WARN ipv6 "IPv6 protection is $_lt_v6" ;; esac
+		case $_lt_dns in redirect) _lt_add PASS dns "DNS queries of the devices are redirected through the exit node" ;;
+		*) _lt_add INFO dns "DNS queries of the devices are not redirected (TSEM_DNS_REDIRECT is empty, the default); see docs/rc/dns-ipv6.md" ;; esac
+		if [ "$_lt_mode" = blocked ]; then
+			if $_lt_curl -s -m 6 --max-filesize 8192 "$_lt_url" >/dev/null 2>&1; then _lt_add FAIL traffic "BLOCKED, but the router reached the Internet: something is not closed"
+			else _lt_add PASS traffic "BLOCKED: the router cannot reach the Internet (no leak)"; fi
+		else
+			case $_lt_state in
+			PRIMARY_ACTIVE | SECONDARY_ACTIVE)
+				_lt_r=$(cmd_egress --json --refresh 2>/dev/null); _lt_ip=$(printf '%s' "$_lt_r" | sed -n 's/.*"ip":"\([^"]*\)".*/\1/p')
+				_lt_cc=$(printf '%s' "$_lt_r" | sed -n 's/.*"country":"\([^"]*\)".*/\1/p')
+				_lt_base=$(cat "$TSEM_STATE_DIR/egress_direct" 2>/dev/null | tr -cd '0-9A-Fa-f.:')
+				if [ -z "$_lt_ip" ]; then
+					# curl exit code 6 = the name could not be resolved: that is a DNS problem of the router, not a problem of the exit node
+					$_lt_curl -s -m 6 --max-filesize 8192 "$_lt_url" >/dev/null 2>&1; _lt_crc=$?
+					if [ "$_lt_crc" -eq 6 ]; then _lt_add WARN router-dns "the router cannot resolve names while protected (the address check needs DNS): check its own DNS (TSEM_DNS_ROUTER and the resolver the router uses); messages to a server NAME fail the same way, use the server IP as the backup address"
+					else _lt_add WARN address "the exit address could not be determined: the exit node may not be carrying traffic yet"; fi
+				elif [ -n "$_lt_base" ] && [ "$_lt_ip" = "$_lt_base" ]; then _lt_add FAIL address "the address seen outside ($_lt_ip) is your OWN uplink address: traffic does not go through the exit node"
+				elif [ -n "$_lt_base" ]; then _lt_add PASS address "the address seen outside is $_lt_ip${_lt_cc:+ ($_lt_cc)}, not your own ($_lt_base)"
+				else _lt_add INFO address "the address seen outside is $_lt_ip${_lt_cc:+ ($_lt_cc)}; your own address is not known yet (switch to DIRECT once and run this test there), check that it is the place you expect"; fi
+				# IPv6: the router has no IPv6 path to the Internet while protected; an answer here would be a leak path
+				_lt_v6r=$($_lt_curl -6 -s -m 6 --max-filesize 8192 "$_lt_url" 2>/dev/null | _lt_ipof)
+				if [ -z "$_lt_v6r" ]; then _lt_add PASS ipv6-traffic "no IPv6 connection leaves the router"
+				else _lt_add WARN ipv6-traffic "the router reached the Internet over IPv6 (address $_lt_v6r): check that this is the exit node's IPv6 and not your uplink"; fi
+				;;
+			*) _lt_add INFO traffic "the exit node is not active (state $_lt_state): traffic is held back, not leaking" ;;
+			esac
+		fi
+		;;
+	*) _lt_add FAIL kill-switch "no valid mode (intent missing or damaged): the router is closed (BLOCKED), repair with tsem set german|direct" ;;
+	esac
+	_lt_res=pass; [ "$_lt_warn" -eq 0 ] || _lt_res=warn; [ "$_lt_fail" -eq 0 ] || _lt_res=fail
+	if [ "$_lt_json" -eq 1 ]; then
+		_lt_items=''
+		_lt_old=$IFS; IFS='
+'
+		for _lt_l in $_lt_txt; do
+			_lt_a=${_lt_l%%|*}; _lt_rest=${_lt_l#*|}; _lt_b=${_lt_rest%%|*}; _lt_c=${_lt_rest#*|}
+			_lt_c=$(printf '%s' "$_lt_c" | tr -d '"\\' | tr -cd ' -~')
+			_lt_items="$_lt_items${_lt_items:+,}{\"status\":\"$_lt_a\",\"name\":\"$_lt_b\",\"text\":\"$_lt_c\"}"
+		done
+		IFS=$_lt_old
+		printf '{"result":"%s","mode":"%s","failed":%s,"warnings":%s,"checks":[%s],"scope":"router"}\n' "$_lt_res" "$_lt_mode" "$_lt_fail" "$_lt_warn" "$_lt_items"
+	else
+		printf '%s' "$_lt_txt" | while IFS='|' read -r _lt_a _lt_b _lt_c; do printf '%-5s %-13s %s\n' "$_lt_a" "$_lt_b" "$_lt_c"; done
+		echo "leaktest: $_lt_res ($_lt_fail failed, $_lt_warn warnings). This checks the router's own traffic and its rules; a device behind it shows what it sees on any 'what is my IP' page."
+	fi
+	[ "$_lt_fail" -eq 0 ]
 }
 
 # ---------------------------------------------------------------- backup / restore of the settings (v1.1)
@@ -1236,6 +1516,8 @@ config) cmd_config "$@" ;;
 nodes) cmd_nodes "$@" ;;
 subnets) cmd_subnets "$@" ;;
 egress) cmd_egress "$@" ;;
+leaktest) cmd_leaktest "$@" ;;
+report) cmd_report "$@" ;;
 interval) cmd_interval ;;
 intent-check) cmd_intent_check ;;
 hw-probe) cmd_hw_probe ;;

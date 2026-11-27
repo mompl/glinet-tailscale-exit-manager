@@ -83,7 +83,7 @@ test_missing_primary_refuses_german_and_changes_nothing() {
 
 test_invalid_exit_node_ip_in_config_is_ignored_not_guessed() {
 	unset TSEM_PRIMARY
-	printf 'TSEM_PRIMARY=100.89.22\nTSEM_PRIMARY_NAME=exit-a\n' >"$T/c.conf"
+	printf 'TSEM_PRIMARY=100.64.0\nTSEM_PRIMARY_NAME=exit-a\n' >"$T/c.conf"
 	assert_rc refused 2 env TSEM_CONF="$T/c.conf" "$SH" "$ROOT/src/usr/sbin/tsem" set german --no-wait
 	assert_eq guard none "$(guard)"
 }
@@ -181,7 +181,7 @@ test_parser_accepts_the_intended_node() {
 
 test_parser_rejects_wrong_ip_unknown_name_offline_and_not_exit_node() {
 	_ts_fixture exit-a 100.64.0.30 true true
-	assert_contains wrongip "does not own" "$(_why exit-a 100.89.22.76)"
+	assert_contains wrongip "does not own" "$(_why exit-a 100.64.0.99)"
 	assert_contains unknown "no node with this name" "$(_why other-host 100.64.0.30)"
 	_ts_fixture exit-a 100.64.0.30 false true
 	assert_contains offline "offline" "$(_why exit-a 100.64.0.30)"

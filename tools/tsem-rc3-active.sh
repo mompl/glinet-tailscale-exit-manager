@@ -680,7 +680,9 @@ cmd_recovery_arm() {
 	TSEM_NOW= AR_RUN=$AR_RUN sh "$AR_RUN/recover.sh" prepare "$_t" >/dev/null 2>&1 || { emit FAIL recovery.arm "cannot write the watchdog state"; exit 1; }
 	if ! wd_svc_add tsem-rc3-wd "$AR_RUN" 0 "${AR_WD_STEP:-2}" "${AR_WD_STALE:-20}" "${AR_WD_GRACE:-10}"; then rm -rf "$RC_DIR"; emit FAIL recovery.arm "procd refused the watchdog service"; exit 1; fi
 	wd_wait_file "$RC_DIR/hb" 15 >/dev/null
-	_h1=$(cat "$RC_DIR/hb" 2>/dev/null); sleep 3; _h2=$(cat "$RC_DIR/hb" 2>/dev/null)
+	# wait (up to 12 s) for the heartbeat to move instead of looking once after a fixed 3 s: a slow start under load is not a failure
+	_h1=$(cat "$RC_DIR/hb" 2>/dev/null); _h2=$_h1; _hw=0
+	while [ "$_hw" -lt 12 ]; do sleep 1; _hw=$((_hw + 1)); _h2=$(cat "$RC_DIR/hb" 2>/dev/null); [ "${_h2:-0}" -gt "${_h1:-0}" ] 2>/dev/null && break; done
 	_pp=$(wd_pids tsem-rc3-wd) || _pp=''
 	if [ -n "$_pp" ] && armed && [ "${_h2:-0}" -gt "${_h1:-0}" ] 2>/dev/null; then
 		emit PASS recovery.arm "watchdog armed under procd (pids $_pp, heartbeat moving): recovery in ${_t}s without keepalive; survives ssh loss, tailscale restart and firewall reload"

@@ -72,10 +72,17 @@ async function main() {
 		assert.strictEqual(r.opts.headers.glinet, '1');
 		const b = JSON.parse(r.opts.body);
 		assert.deepStrictEqual(b.params.slice(0, 3), ['sid-abc=123', 'tsem', 'call']);
-		assert.ok(['status', 'events', 'config_get', 'nodes', 'subnets'].includes(b.params[3].m), 'only read methods at load: ' + b.params[3].m);
+		assert.ok(['status', 'events', 'config_get', 'nodes', 'subnets', 'notify_get'].includes(b.params[3].m), 'only read methods at load: ' + b.params[3].m);
 		assert.ok(!JSON.stringify(b).includes('http'), 'no URLs/secrets in the request');
 	}
 	let t = text(m.tree());
+	assert.ok(/Messages \(ntfy\)/.test(t), 'the message settings card is shown');
+	assert.ok(find(m.tree(), 'tsem-btn-nsave') && find(m.tree(), 'tsem-btn-ntest'), 'save and test buttons exist');
+	assert.ok(!find(m.tree(), 'tsem-btn-nclear'), 'no backup server yet: no remove button');
+	assert.ok(find(m.tree(), 'tsem-direct-for'), 'DIRECT duration choice exists');
+	assert.ok(find(m.tree(), 'tsem-btn-leak'), 'leak test button exists');
+	assert.ok(find(m.tree(), 'tsem-btn-report'), 'statistics button exists');
+	assert.ok(!find(m.tree(), 'tsem-btn-keepdirect'), 'no timer running: no keep-DIRECT button');
 	assert.ok(/saved mode is missing|BLOCKED/.test(t), 'fresh controller shows BLOCKED/missing intent: ' + t);
 	assert.ok(/Reached\s+no \(/.test(t.replace(/\s+/g, ' ').replace('Actually reached', 'Reached')), 'reached must be "no"');
 

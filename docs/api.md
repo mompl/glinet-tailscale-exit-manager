@@ -56,6 +56,7 @@ Rules:
 
     ubus call tsem status
     ubus call tsem set_mode '{"mode":"german","source":"api"}'
+    ubus call tsem set_mode '{"mode":"direct","confirm":true,"duration":"1h"}'   # DIRECT for one hour, then back (status: direct_until, direct_return)
     curl -s -d '{"jsonrpc":"2.0","id":1,"method":"call","params":["<session>","tsem","status",{}]}' http://ROUTER/ubus
 
 

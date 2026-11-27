@@ -4,6 +4,7 @@
 #   tsem-notify tick OLD NEW    called by the controller after a tick: queues an event if the state changed, then sends the queue
 #   tsem-notify test            sends a test message now (prints what happened)
 #   tsem-notify queue           shows what is waiting to be sent
+#   tsem-notify report TEXT     sends a one-line report (used by 'tsem report --notify'; it does not depend on NOTIFY_EVENTS)
 #
 # It only talks to the notification URL; it never touches firewall rules, routes or tailscale, and the controller never waits for it.
 # While the kill switch is closed the Internet is not reachable, so a BLOCKED message waits in a queue (tmpfs, at most 20 lines) and
@@ -23,7 +24,7 @@ LOCK=$RUN/notify.lock
 
 lg() { printf 'tsem-notify: %s\n' "$*" >&2; command -v logger >/dev/null 2>&1 && [ "${TSEM_SYSLOG:-1}" = 1 ] && logger -t tsem-notify -- "$*"; return 0; }
 
-N_TYPE=ntfy N_URL='' N_URL2='' N_NAME='' N_EVENTS='failover blocked recovered' N_TOKENFILE='' N_PRIO_BLOCKED=urgent
+N_TYPE=ntfy N_URL='' N_URL2='' N_NAME='' N_EVENTS='failover blocked recovered' N_TOKENFILE='' N_TOKENFILE2='' N_PRIO_BLOCKED=urgent
 load_conf() {
 	[ -r "$NOTIFY_CONF" ] || return 1
 	while IFS= read -r l || [ -n "$l" ]; do
@@ -38,6 +39,7 @@ load_conf() {
 		NOTIFY_NAME) case $v in '' | *[!A-Za-z0-9._-]*) lg "bad $k" ;; *) N_NAME=$v ;; esac ;;
 		NOTIFY_EVENTS) case $v in *[!a-z\ ]*) lg "bad $k" ;; *) N_EVENTS=$v ;; esac ;;
 		NOTIFY_TOKEN_FILE) case $v in /*) case $v in *[!A-Za-z0-9./_-]*) lg "bad $k" ;; *) N_TOKENFILE=$v ;; esac ;; *) lg "bad $k" ;; esac ;;
+		NOTIFY_TOKEN_FILE_FALLBACK) case $v in /*) case $v in *[!A-Za-z0-9./_-]*) lg "bad $k" ;; *) N_TOKENFILE2=$v ;; esac ;; *) lg "bad $k" ;; esac ;;
 		*) lg "unknown key $k ignored" ;;
 		esac
 	done <"$NOTIFY_CONF"
@@ -76,32 +78,41 @@ text_of() { # event
 }
 
 prio_of() { case $1 in blocked | error) echo urgent ;; failover) echo high ;; *) echo default ;; esac; }
-tag_of() { case $1 in blocked) echo rotating_light ;; failover) echo warning ;; recovered | exit) echo white_check_mark ;; direct) echo unlock ;; error) echo x ;; *) echo information_source ;; esac; }
+tag_of() { case $1 in report) echo bar_chart ;; blocked) echo rotating_light ;; failover) echo warning ;; recovered | exit) echo white_check_mark ;; direct) echo unlock ;; error) echo x ;; *) echo information_source ;; esac; }
 
 send_one() { # epoch event text -> 0 sent
 	_ts=$1 _ev=$2 _tx=$3
 	command -v "$CURL" >/dev/null 2>&1 || { lg "curl is not installed"; return 1; }
 	_when=$(date -d "@$_ts" '+%H:%M:%S' 2>/dev/null || date -r "$_ts" '+%H:%M:%S' 2>/dev/null || echo "")
 	[ -z "$_when" ] || _tx="$_tx (event time $_when)"
+	if [ "$N_TYPE" = ntfy ]; then
+		_body=$_tx
+	else
+		_body=$(printf '{"router":"%s","event":"%s","time":%s,"message":"%s"}' "$N_NAME" "$_ev" "$_ts" "$(printf '%s' "$_tx" | tr -d '"\\')")
+	fi
+	send_to "$N_URL" "$N_TOKENFILE" && return 0
+	# the main address (normally the public one) did not work, for example in BLOCKED: try the second one (a server on the tailnet or in the LAN)
+	[ -n "$N_URL2" ] || return 1
+	send_to "$N_URL2" "${N_TOKENFILE2:-$N_TOKENFILE}"
+}
+
+# one request to one address; every address can have its own access token. Uses $_ev and $_body of send_one.
+host_of() { _h=${1#*://}; echo "${_h%%/*}"; }
+
+send_to() { # url tokenfile
+	_used=$1
 	_cfg=$RUN/notify.curl
 	: >"$_cfg"
-	if [ -n "$N_TOKENFILE" ] && [ -r "$N_TOKENFILE" ]; then
-		printf 'header = "Authorization: Bearer %s"\n' "$(tr -d '\r\n"' <"$N_TOKENFILE")" >>"$_cfg"
+	if [ -n "$2" ] && [ -r "$2" ]; then
+		printf 'header = "Authorization: Bearer %s"\n' "$(tr -d '\r\n"' <"$2")" >>"$_cfg"
 	fi
 	if [ "$N_TYPE" = ntfy ]; then
 		printf 'header = "Title: tsem %s"\nheader = "Priority: %s"\nheader = "Tags: %s"\n' "$_ev" "$(prio_of "$_ev")" "$(tag_of "$_ev")" >>"$_cfg"
-		_body=$_tx
 	else
 		printf 'header = "Content-Type: application/json"\n' >>"$_cfg"
-		_body=$(printf '{"router":"%s","event":"%s","time":%s,"message":"%s"}' "$N_NAME" "$_ev" "$_ts" "$(printf '%s' "$_tx" | tr -d '"\\')")
 	fi
-	"$CURL" -s -f -m 10 -K "$_cfg" -d "$_body" "$N_URL" >/dev/null 2>&1
+	"$CURL" -s -f -m 10 -K "$_cfg" -d "$_body" "$1" >/dev/null 2>&1
 	_rc=$?
-	# the main address (normally the public one) did not work, for example in BLOCKED: try the second one (a server on the tailnet)
-	if [ "$_rc" -ne 0 ] && [ -n "$N_URL2" ]; then
-		"$CURL" -s -f -m 10 -K "$_cfg" -d "$_body" "$N_URL2" >/dev/null 2>&1
-		_rc=$?
-	fi
 	rm -f "$_cfg"
 	return $_rc
 }
@@ -148,13 +159,121 @@ tick)
 	;;
 test)
 	load_conf || { echo "tsem-notify: no usable $NOTIFY_CONF"; exit 1; }
-	if send_one "$(date +%s)" test "$(text_of test)"; then echo "tsem-notify: sent to $N_URL"; else echo "tsem-notify: could not send to $N_URL"; exit 1; fi
+	# only the server name is printed: on a public server the topic is a secret
+	if send_one "$(date +%s)" test "$(text_of test)"; then echo "tsem-notify: sent via $(host_of "$_used")"; else echo "tsem-notify: could not send (tried $(host_of "$N_URL")${N_URL2:+ and $(host_of "$N_URL2")})"; exit 1; fi
 	;;
 queue)
 	[ -s "$Q" ] && cat "$Q" || echo "(empty)"
 	;;
+report)
+	[ -n "${2:-}" ] || exit 2
+	load_conf || exit 0
+	_rtx=$(printf '%s' "$2" | tr -d '|\\\\"' | tr -cd ' -~' | cut -c1-300)
+	run_report() { printf '%s|report|%s: %s\n' "$(date +%s)" "$N_NAME" "$_rtx" >>"$Q"; flush; }
+	with_lock run_report
+	;;
+show)
+	# what is configured, without secrets: on a public server the topic name acts like a password, so it is masked
+	if [ "${2:-}" = --json ]; then
+		if [ -r "$NOTIFY_CONF" ] && load_conf 2>/dev/null; then
+			_tk() { [ -n "$1" ] && [ -r "$1" ] && echo true || echo false; }
+			printf '{"configured":true,"type":"%s","name":"%s","server":"%s","token":%s,"fallback_server":"%s","fallback_token":%s,"events":"%s"}\n' "$N_TYPE" "$N_NAME" "$(host_of "$N_URL")" "$(_tk "$N_TOKENFILE")" "$([ -z "$N_URL2" ] || host_of "$N_URL2")" "$(_tk "${N_TOKENFILE2:-$N_TOKENFILE}")" "$N_EVENTS"
+		else
+			echo '{"configured":false}'
+		fi
+		exit 0
+	fi
+	[ -r "$NOTIFY_CONF" ] || { echo "no notification is configured ($NOTIFY_CONF)"; exit 0; }
+	load_conf || exit 1
+	_host() { host_of "$1"; }
+	_has() { [ -n "$1" ] && [ -r "$1" ] && echo yes || echo no; }
+	echo "type: $N_TYPE"
+	echo "name: $N_NAME"
+	echo "main: $(_host "$N_URL")  (topic hidden)  token: $(_has "$N_TOKENFILE")"
+	[ -z "$N_URL2" ] || echo "fallback: $(_host "$N_URL2")  (topic hidden)  token: $(_has "${N_TOKENFILE2:-$N_TOKENFILE}")"
+	echo "events: $N_EVENTS"
+	;;
+token)
+	# stores an access token from standard input (never as an argument, so it stays out of the shell history and the process list)
+	_tf=${2:-/etc/tsem/notify.token}
+	case $_tf in /*) case $_tf in *[!A-Za-z0-9./_-]*) echo "tsem-notify: unsafe file name" >&2; exit 2 ;; esac ;; *) echo "tsem-notify: the file must be an absolute path" >&2; exit 2 ;; esac
+	IFS= read -r _tok || true
+	_tok=$(printf '%s' "$_tok" | tr -d ' \r\n\t')
+	case $_tok in '' | *[!A-Za-z0-9._-]*) echo "tsem-notify: the token is empty or has unusual characters; nothing was written" >&2; exit 2 ;; esac
+	( umask 077; printf '%s\n' "$_tok" >"$_tf.new" ) && mv "$_tf.new" "$_tf" && chmod 600 "$_tf" && echo "tsem-notify: token stored in $_tf (mode 600)"
+	;;
+setup)
+	shift
+	_srv='' _top='' _tkf='' _fsrv='' _ftop='' _ftkf='' _nm='' _evs='' _pub=0 _typ=ntfy
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--server) _srv=${2:-}; shift 2 ;;
+		--topic) _top=${2:-}; shift 2 ;;
+		--token-file) _tkf=${2:-}; shift 2 ;;
+		--fallback-server) _fsrv=${2:-}; shift 2 ;;
+		--fallback-topic) _ftop=${2:-}; shift 2 ;;
+		--fallback-token-file) _ftkf=${2:-}; shift 2 ;;
+		--name) _nm=${2:-}; shift 2 ;;
+		--events) _evs=${2:-}; shift 2 ;;
+		--public) _pub=1; shift ;;
+		--webhook) _typ=webhook; shift ;;
+		*) echo "tsem-notify setup: unknown option $1" >&2; exit 2 ;;
+		esac
+	done
+	if [ "$_pub" = 1 ]; then
+		[ -z "$_srv" ] || { echo "tsem-notify setup: --public and --server exclude each other" >&2; exit 2; }
+		_srv=https://ntfy.sh
+		[ -n "$_top" ] || _top=tsem-$(tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c 24)
+		case $_top in tsem-) echo "tsem-notify setup: could not create a random topic" >&2; exit 1 ;; esac
+	fi
+	[ -n "$_srv" ] || { echo "usage: tsem-notify setup (--public | --server URL [--topic NAME]) [--token-file F] [--fallback-server URL [--fallback-topic NAME] [--fallback-token-file F]] [--name N] [--events 'a b'] [--webhook]" >&2; exit 2; }
+	_ok_url() { case $1 in http://* | https://*) case $1 in *[!A-Za-z0-9./:_?=\&%@+-]*) return 1 ;; *) return 0 ;; esac ;; *) return 1 ;; esac; }
+	_ok_top() { case $1 in '' | *[!A-Za-z0-9_-]*) return 1 ;; *) return 0 ;; esac; }
+	_ok_file() { case $1 in '') return 0 ;; /*) case $1 in *[!A-Za-z0-9./_-]*) return 1 ;; *) return 0 ;; esac ;; *) return 1 ;; esac; }
+	_ok_url "$_srv" || { echo "tsem-notify setup: --server must be an http(s) address without unusual characters" >&2; exit 2; }
+	if [ "$_typ" = ntfy ]; then
+		_ok_top "$_top" || { echo "tsem-notify setup: --topic is required for ntfy (letters, digits, - and _)" >&2; exit 2; }
+		_url=${_srv%/}/$_top
+	else
+		_url=$_srv
+	fi
+	_url2=''
+	if [ -n "$_fsrv" ]; then
+		_ok_url "$_fsrv" || { echo "tsem-notify setup: --fallback-server is not a valid http(s) address" >&2; exit 2; }
+		if [ "$_typ" = ntfy ]; then
+			_ftop=${_ftop:-$_top}
+			_ok_top "$_ftop" || { echo "tsem-notify setup: --fallback-topic is not valid" >&2; exit 2; }
+			_url2=${_fsrv%/}/$_ftop
+		else
+			_url2=$_fsrv
+		fi
+	fi
+	_ok_file "$_tkf" && _ok_file "$_ftkf" || { echo "tsem-notify setup: token files must be absolute paths" >&2; exit 2; }
+	case $_nm in '' | *[!A-Za-z0-9._-]*) [ -z "$_nm" ] || { echo "tsem-notify setup: --name has unusual characters" >&2; exit 2; } ;; esac
+	case $_evs in *[!a-z\ ]*) echo "tsem-notify setup: --events must be words like: failover blocked recovered exit direct error" >&2; exit 2 ;; esac
+	_new=$NOTIFY_CONF.new
+	(
+		umask 077
+		{
+			echo "# written by 'tsem-notify setup'"
+			echo "NOTIFY_TYPE=$_typ"
+			echo "NOTIFY_URL=$_url"
+			[ -z "$_url2" ] || echo "NOTIFY_URL_FALLBACK=$_url2"
+			[ -z "$_nm" ] || echo "NOTIFY_NAME=$_nm"
+			[ -z "$_evs" ] || echo "NOTIFY_EVENTS=\"$_evs\""
+			[ -z "$_tkf" ] || echo "NOTIFY_TOKEN_FILE=$_tkf"
+			[ -z "$_ftkf" ] || echo "NOTIFY_TOKEN_FILE_FALLBACK=$_ftkf"
+		} >"$_new"
+	) && mv "$_new" "$NOTIFY_CONF" && chmod 600 "$NOTIFY_CONF" || { rm -f "$_new"; echo "tsem-notify setup: could not write $NOTIFY_CONF" >&2; exit 1; }
+	echo "tsem-notify: saved $NOTIFY_CONF (mode 600)"
+	if [ "$_pub" = 1 ]; then
+		echo "NOTE: ntfy.sh is a public server. Anyone who knows the topic can read the messages and send fake ones, and the text passes through that server."
+		echo "      The topic works like a password: $_top"
+		echo "      Subscribe to exactly this topic in the ntfy app. For a private server use --server instead. Test: tsem-notify test"
+	fi
+	;;
 *)
-	echo "usage: tsem-notify tick OLD NEW | test | queue" >&2
+	echo "usage: tsem-notify tick OLD NEW | test | queue | show | setup ... | token [FILE]" >&2
 	exit 2
 	;;
 esac

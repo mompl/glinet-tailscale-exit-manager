@@ -341,3 +341,30 @@ test_setup_update_of_a_protected_router_keeps_the_exit_mode_and_never_passes_thr
 	case $(cat "$T/setup.out") in *"running in DIRECT mode"*) fail "an update must not switch a protected router to DIRECT" ;; esac
 	assert_contains restarted "restart" "$(cat "$T/initd.calls")"
 }
+
+test_setup_notify_options_write_a_private_notify_config() {
+	_su_env
+	_su --yes --primary node-a --notify-server https://ntfy.example --notify-topic my-topic --notify-fallback-server http://192.0.2.10:8098 --notify-token-file /etc/tsem/notify.token || fail "setup failed: $(cat "$T/setup.out")"
+	_c=$(cat "$RT/etc/tsem/notify.conf")
+	assert_contains url "NOTIFY_URL=https://ntfy.example/my-topic" "$_c"
+	assert_contains fb "NOTIFY_URL_FALLBACK=http://192.0.2.10:8098/my-topic" "$_c"
+	assert_contains tok "NOTIFY_TOKEN_FILE=/etc/tsem/notify.token" "$_c"
+	assert_eq mode 600 "$(stat -c %a "$RT/etc/tsem/notify.conf" 2>/dev/null || stat -f %Lp "$RT/etc/tsem/notify.conf")"
+	assert_contains said "messages are configured" "$(cat "$T/setup.out")"
+}
+
+test_setup_notify_public_uses_ntfy_sh_with_a_random_topic_and_says_it_is_public() {
+	_su_env
+	_su --yes --primary node-a --notify-public || fail "setup failed: $(cat "$T/setup.out")"
+	case $(sed -n 's/^NOTIFY_URL=//p' "$RT/etc/tsem/notify.conf") in https://ntfy.sh/tsem-*) ;; *) fail "public setup must use ntfy.sh" ;; esac
+	assert_contains warn "anyone who knows the topic" "$(cat "$T/setup.out")"
+}
+
+test_setup_notify_options_that_do_not_fit_together_are_refused() {
+	_su_env
+	if _su --yes --primary node-a --notify-server https://ntfy.example; then fail "a server without a topic must be refused"; fi
+	assert_contains why "belong together" "$(cat "$T/setup.out")"
+	_su_env
+	if _su --yes --primary node-a --notify-public --notify-server https://ntfy.example --notify-topic t; then fail "public together with a server must be refused"; fi
+	assert_contains why "exclude each other" "$(cat "$T/setup.out")"
+}

@@ -41,7 +41,7 @@ writes = set(acl["tsem-write"]["write"]["ubus"]["tsem"])
 assert reads.isdisjoint(writes)
 assert set(acl["tsem-write"]["read"]["ubus"]["tsem"]) == reads
 assert reads | writes == set(lst), (reads | writes, set(lst))
-assert writes == {"set_mode", "set_failover", "failover_now", "config_set"}
+assert writes == {"set_mode", "set_failover", "failover_now", "config_set", "notify_set", "notify_test"}
 # no wildcard / unauthenticated grants anywhere
 raw = open(root + "/src/usr/share/rpcd/acl.d/tsem.json").read()
 assert '"*"' not in raw and "unauthenticated" not in raw
@@ -362,4 +362,124 @@ test_api_egress_reads_the_public_address_sanitises_it_and_is_read_only() {
 	# the method exists in the read ACL only
 	grep -q '"egress"' "$ROOT/src/usr/share/rpcd/acl.d/tsem.json" || fail "egress missing in the ACL"
 	unset TSEM_CURL TSEM_RUN_DIR
+}
+
+_api_notify_setup() {
+	_api_setup
+	printf '#!/bin/sh\nexec "%s" "%s/src/usr/sbin/tsem-notify" "$@"\n' "$SH" "$ROOT" >"$T/bin/tsem-notify"; chmod +x "$T/bin/tsem-notify"
+	export TSEM_NOTIFY_BIN=$T/bin/tsem-notify TSEM_NOTIFY_CONF=$T/notify.conf TSEM_NOTIFY_TOKEN=$T/notify.token TSEM_NOTIFY_TOKEN2=$T/notify.token2
+	export TSEM_RUN_DIR=$T/run TSEM_CURL=$T/bin/curl TSEM_SYSLOG=0
+	mkdir -p "$T/run"
+	printf '#!/bin/sh\nprintf "%%s\n" "$*" >>"%s/curl.args"\nexit 0\n' "$T" >"$T/bin/curl"; chmod +x "$T/bin/curl"
+}
+
+test_api_notify_set_saves_server_topic_and_tokens_and_never_returns_them() {
+	_api_notify_setup
+	_r=$(api notify_set '{"server":"https://ntfy.example","topic":"very-secret-topic","fallback_server":"http://192.0.2.10:8098","token":"tk_main123","fallback_token":"tk_lan456","name":"r7"}')
+	assert_eq ok true "$(printf '%s' "$_r" | jget ok)"
+	assert_eq server ntfy.example "$(printf '%s' "$_r" | jget notify.server)"
+	assert_eq fallback 192.0.2.10:8098 "$(printf '%s' "$_r" | jget notify.fallback_server)"
+	assert_eq token true "$(printf '%s' "$_r" | jget notify.token)"
+	assert_eq fbtoken true "$(printf '%s' "$_r" | jget notify.fallback_token)"
+	case $_r in *very-secret-topic* | *tk_main123* | *tk_lan456*) fail "the reply must never contain the topic or a token" ;; esac
+	assert_contains topic-in-file "NOTIFY_URL=https://ntfy.example/very-secret-topic" "$(cat "$T/notify.conf")"
+	assert_eq tokenfile "tk_main123" "$(cat "$T/notify.token")"
+	assert_eq mode 600 "$(stat -c %a "$T/notify.token" 2>/dev/null || stat -f %Lp "$T/notify.token")"
+	_g=$(api notify_get)
+	assert_eq get-server ntfy.example "$(printf '%s' "$_g" | jget notify.server)"
+	case $_g in *very-secret-topic* | *tk_main123*) fail "notify_get must never contain the topic or a token" ;; esac
+}
+
+test_api_notify_set_keeps_an_existing_token_when_none_is_sent() {
+	_api_notify_setup
+	api notify_set '{"server":"https://ntfy.example","topic":"t1","token":"tk_keep1"}' >/dev/null
+	_r=$(api notify_set '{"server":"https://other.example","topic":"t2"}')
+	assert_eq server other.example "$(printf '%s' "$_r" | jget notify.server)"
+	assert_eq token-kept true "$(printf '%s' "$_r" | jget notify.token)"
+	assert_eq content "tk_keep1" "$(cat "$T/notify.token")"
+}
+
+test_api_notify_set_public_and_bad_input() {
+	_api_notify_setup
+	# a fresh router has no topic to carry over: a server alone is not enough
+	assert_eq no-topic false "$(api notify_set '{"server":"https://x.example"}' | jget ok)"
+	_r=$(api notify_set '{"public":true}')
+	assert_eq ok true "$(printf '%s' "$_r" | jget ok)"
+	assert_eq host ntfy.sh "$(printf '%s' "$_r" | jget notify.server)"
+	case $(sed -n 's/^NOTIFY_URL=//p' "$T/notify.conf") in https://ntfy.sh/tsem-*) ;; *) fail "public must use ntfy.sh with a random topic" ;; esac
+	_before=$(cat "$T/notify.conf")
+	for _j in '{}' '{"server":"ftp://x/y","topic":"t"}' '{"server":"https://x.example","topic":"a/b"}' '{"server":"https://x.example","topic":"t","token":"a;b"}' '{"server":"https://x.example","topic":"t","events":"X;Y"}'; do
+		_e=$(api notify_set "$_j")
+		assert_eq "refused $_j" false "$(printf '%s' "$_e" | jget ok)"
+		assert_eq "code $_j" invalid_argument "$(printf '%s' "$_e" | jget code)"
+		assert_eq "config untouched after $_j" "$_before" "$(cat "$T/notify.conf")"
+	done
+}
+
+test_api_notify_get_without_config_and_notify_test() {
+	_api_notify_setup
+	assert_eq none false "$(api notify_get | jget notify.configured)"
+	assert_eq refused false "$(api notify_test | jget ok)"
+	api notify_set '{"server":"https://ntfy.example","topic":"t1"}' >/dev/null
+	_t=$(api notify_test)
+	assert_eq sent true "$(printf '%s' "$_t" | jget ok)"
+	case $_t in *t1*) ;; esac
+	assert_contains url "https://ntfy.example/t1" "$(cat "$T/curl.args")"
+}
+
+test_api_notify_set_keeps_topic_name_events_and_the_backup_server_when_the_form_leaves_them_empty() {
+	_api_notify_setup
+	printf 'NOTIFY_TYPE=ntfy\nNOTIFY_URL=https://ntfy.example/keep-this-topic\nNOTIFY_URL_FALLBACK=http://192.0.2.10:8098/keep-this-topic\nNOTIFY_NAME=router9\nNOTIFY_EVENTS="failover blocked recovered exit direct error"\n' >"$T/notify.conf"
+	# only a token is sent, as when the user pastes a new token into the form
+	_r=$(api notify_set '{"token":"tk_new789"}')
+	assert_eq ok true "$(printf '%s' "$_r" | jget ok)"
+	_c=$(cat "$T/notify.conf")
+	assert_contains url "NOTIFY_URL=https://ntfy.example/keep-this-topic" "$_c"
+	assert_contains fb "NOTIFY_URL_FALLBACK=http://192.0.2.10:8098/keep-this-topic" "$_c"
+	assert_contains name "NOTIFY_NAME=router9" "$_c"
+	assert_contains events 'NOTIFY_EVENTS="failover blocked recovered exit direct error"' "$_c"
+	assert_contains tokfile "NOTIFY_TOKEN_FILE=$T/notify.token" "$_c"
+	# the backup server can be removed on purpose
+	_r=$(api notify_set '{"clear_fallback":true}')
+	assert_eq ok true "$(printf '%s' "$_r" | jget ok)"
+	case $(cat "$T/notify.conf") in *NOTIFY_URL_FALLBACK*) fail "the backup server must be gone" ;; esac
+	assert_contains url-still "NOTIFY_URL=https://ntfy.example/keep-this-topic" "$(cat "$T/notify.conf")"
+}
+
+test_api_set_mode_direct_with_a_duration_starts_the_timer_and_bad_ones_are_refused() {
+	_api_setup
+	_r=$(api set_mode '{"mode":"direct","confirm":true,"duration":"30m"}')
+	assert_eq ok true "$(printf '%s' "$_r" | jget ok)"
+	_u=$(printf '%s' "$_r" | jget status.direct_until)
+	[ "$_u" -gt 0 ] || fail "the reply must show the timer (direct_until), got $_u"
+	assert_eq return german "$(printf '%s' "$_r" | jget status.direct_return)"
+	for _j in '{"mode":"direct","confirm":true,"duration":"0"}' '{"mode":"direct","confirm":true,"duration":"abc"}' '{"mode":"direct","confirm":true,"duration":"25h"}' \
+		'{"mode":"german","duration":"30m"}' '{"mode":"direct","confirm":true,"duration":"5;reboot"}'; do
+		assert_eq "refused $_j" false "$(api set_mode "$_j" | jget ok)"
+	done
+	# DIRECT again without a duration removes the timer
+	_r=$(api set_mode '{"mode":"direct","confirm":true}')
+	assert_eq removed 0 "$(printf '%s' "$_r" | jget status.direct_until)"
+}
+
+test_api_leaktest_returns_the_result_object_even_when_the_test_fails() {
+	_api_setup
+	# no valid mode in this fixture: the test FAILs, and the API still hands over the result
+	_r=$(api leaktest)
+	assert_eq ok true "$(printf '%s' "$_r" | jget ok)"
+	assert_eq result fail "$(printf '%s' "$_r" | jget result.result)"
+	assert_contains scope router "$(printf '%s' "$_r" | jget result.scope)"
+}
+
+test_api_report_returns_the_numbers_for_the_period() {
+	_api_setup
+	_t=$TSEM_NOW
+	printf '%s\n' "$((_t - 100000))|BOOT" "$((_t - 100000))|PRIMARY_ACTIVE" "$((_t - 1000))|BLOCKED" >"$TSEM_STATE_DIR/history"
+	_r=$(api report '{"days":3}')
+	assert_eq ok true "$(printf '%s' "$_r" | jget ok)"
+	assert_eq days 3 "$(printf '%s' "$_r" | jget result.days)"
+	assert_eq exit 99000 "$(printf '%s' "$_r" | jget result.seconds.exit)"
+	assert_eq blocked 1000 "$(printf '%s' "$_r" | jget result.seconds.blocked)"
+	assert_eq refused false "$(api report '{"days":500}' | jget ok)"
+	assert_eq refused2 false "$(api report '{"days":"x;y"}' | jget ok)"
 }

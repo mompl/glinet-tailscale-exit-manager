@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.2.0
+
+Known limitation (also in 1.1.0), found on real hardware while testing 1.2
+- A router whose own resolver (dnsmasq) uses a **private upstream resolver** (a travel router behind another router) cannot resolve names while the exit mode is active; the failure is closed, not open.
+  `tsem selftest` and `tsem leaktest` now report it. Workaround and cause in `docs/rc/dns-ipv6.md`; a fix in tsem is planned.
+
+New
+- **Statistics and a weekly report.** `tsem report [--days N] [--json] [--notify]`: time in each mode, failovers, BLOCKED episodes, restarts. A small history (a few lines a week, only on changes) is kept;
+  time the router was off is not counted as a mode. Optional weekly one-line message (add `report` to `NOTIFY_EVENTS`), a Statistics card in the GL.iNet page, API `report`. See `docs/rc/report.md`.
+- **Leak test.** `tsem leaktest` (button "Leak test" in the GL.iNet page, API `leaktest`): checks the router's own traffic and rules in the current mode, in EXIT that the
+  address seen outside is not your own uplink address (compared with the address remembered from DIRECT), IPv6, DNS and the kill switch; in BLOCKED that nothing leaves.
+  Read-only. See `docs/rc/leak-test.md`.
+- **Temporary DIRECT.** `tsem set direct --for 1h` (30m, 2h, 90 = minutes; 1 minute to 24 hours), in the GL.iNet page a "DIRECT for" choice, API `set_mode` with `duration`.
+  The controller itself brings the router back to the mode it came from (EXIT or BLOCKED) when the time is over: no GUI and no Home Assistant needed. The timer
+  belongs to that one DIRECT: any later action of yours (`tsem set`, the switch, the GUI) voids it, so nothing switches back by surprise; `tsem set direct` again removes it.
+  A damaged timer file is ignored; if the clock goes backwards the router returns to protection. `tsem status` shows `direct_until` and `direct_return`.
+- **Messages: choose your server.** Your own ntfy server or the public ntfy.sh, your choice; TSEM ships no address of anyone. Every address has its own
+  access token (`NOTIFY_TOKEN_FILE`, `NOTIFY_TOKEN_FILE_FALLBACK`). `tsem-notify setup | show | token`, `setup.sh --notify-server/--notify-topic/--notify-token-file/--notify-fallback-server/--notify-public`,
+  and a **Messages (ntfy)** card in the GL.iNet page (new API methods `notify_get`, `notify_set`, `notify_test`; not yet in LuCI). A topic or a token is never printed or returned.
+  `tsem-notify test` names the server only. See `docs/rc/notifications.md`.
+
 ## 1.1.0
 
 New

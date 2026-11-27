@@ -127,7 +127,7 @@ if [ "$PURGE" -eq 1 ]; then
 	rm -rf "$CONF_DIR"
 	say "purged /etc/tsem"
 else
-	rm -f "$MANIFEST" "$CONF_DIR/intent"
+	rm -f "$MANIFEST" "$CONF_DIR/intent" "$CONF_DIR/direct_until"
 	say "kept /etc/tsem/tsem.conf and backups in /etc/tsem/backup"
 fi
 say "uninstalled. Kill switch is OFF. Tailscale exit-node setting was left unchanged:"

@@ -1133,7 +1133,7 @@ echo "tailscale $*" >>"$FAKE_F/ts.calls"
 case $1 in
 status) echo "100.89.254.34 gl-mt3000 tskey-auth-SECRET123 linux"; echo '"PrivateKey": "privkey:abcdef"'; echo "100.64.0.31 exit-b linux active; exit node; direct" ;;
 debug) echo '"RouteAll": true'; echo '"ExitNodeID": "nXYZ"' ;;
-ping) echo "pong from exit-b (100.64.0.31) via 185.146.50.48:20513 in 217ms" ;;
+ping) echo "pong from exit-b (100.64.0.31) via 203.0.113.48:20513 in 217ms" ;;
 esac
 exit 0
 EOS
@@ -1168,7 +1168,7 @@ echo "tailscale $*" >>"$FAKE_F/ts.calls"
 [ "$1" = ping ] || exit 0
 case $5 in
 *100.64.0.30*) echo "pong from exit-a (100.64.0.30) via DERP(nue) in 224ms" ;;
-*) echo "pong from exit-b (100.64.0.31) via 185.146.50.48:20513 in 217ms" ;;
+*) echo "pong from exit-b (100.64.0.31) via 203.0.113.48:20513 in 217ms" ;;
 esac
 EOS
 	chmod +x "$FB/tailscale"

@@ -139,7 +139,7 @@ var CSS = [
 return {
 	name: 'tsem',
 	data: function() {
-		return { l: L.lang(), status: null, config: {}, nodes: [], nets: [], events: [], diag: null, msg: '', msgBad: false, msgConn: false, busy: false, sel: { primary: '', secondary: '', failover: true, auto_return: true, mode_label: '', nets: [] }, egress: null, egressBusy: false, egressAuto: '', timer: null };
+		return { l: L.lang(), status: null, config: {}, nodes: [], nets: [], events: [], diag: null, msg: '', msgBad: false, msgConn: false, busy: false, sel: { primary: '', secondary: '', failover: true, auto_return: true, mode_label: '', nets: [] }, egress: null, egressBusy: false, egressAuto: '', timer: null, directFor: '', rep: null, leak: null, leakBusy: false, notify: null, nsel: { kind: 'own', server: '', topic: '', token: '', fb_server: '', fb_token: '' } };
 	},
 	created: function() {
 		var self = this;
@@ -166,8 +166,10 @@ return {
 		say: function(text, bad) { this.msg = text; this.msgBad = !!bad; this.msgConn = false; },
 		loadAll: function() {
 			var self = this;
-			return Promise.all([ self.call('config_get'), self.call('nodes'), self.call('subnets').catch(function() { return {}; }) ]).then(function(r) {
+			return Promise.all([ self.call('config_get'), self.call('nodes'), self.call('subnets').catch(function() { return {}; }), self.call('notify_get').catch(function() { return {}; }) ]).then(function(r) {
 				self.config = r[0].config || {};
+				self.notify = r[3] && r[3].notify || null;
+				self.nsel.kind = (self.notify && self.notify.server === 'ntfy.sh') ? 'public' : 'own';
 				self.nodes = (r[1].result && r[1].result.nodes) || [];
 				self.nets = (r[2].result && r[2].result.subnets) || [];
 				var on = self.nets.filter(function(n) { return n.allowed; }).map(function(n) { return n.cidr; });
@@ -212,8 +214,12 @@ return {
 		toGerman: function() { return this.act(this.call('set_mode', { mode: 'german', source: 'gui' })); },
 		toDirect: function() {
 			if (typeof window !== 'undefined' && !window.confirm(T('confirm_direct', this.l))) return null;
-			return this.act(this.call('set_mode', { mode: 'direct', source: 'gui', confirm: true }));
+			var p = { mode: 'direct', source: 'gui', confirm: true };
+			if (this.directFor) p.duration = this.directFor;
+			return this.act(this.call('set_mode', p));
 		},
+		/* DIRECT again without a duration removes a running timer: DIRECT stays until the user changes it */
+		keepDirect: function() { return this.act(this.call('set_mode', { mode: 'direct', source: 'gui', confirm: true })); },
 		failNow: function() { return this.act(this.call('failover_now')); },
 		save: function() {
 			var self = this, s = self.sel;
@@ -222,6 +228,44 @@ return {
 			var listed = (fb.length || ((self.config.nodes || []).length > 2)) ? (function() { var ips = [ s.primary ].concat(s.secondary ? [ s.secondary ] : []).concat(fb); return { nodes: ips.join(' '), node_names: ips.map(function(ip) { return nm(ip) || '-'; }).join(' ') }; })() : { primary: s.primary, primary_name: nm(s.primary), secondary: s.secondary, secondary_name: nm(s.secondary) };
 			return self.act(self.call('config_set', Object.assign(listed, { auto_return: !!s.auto_return, mode_label: String(s.mode_label || '').trim(), hw_at_boot: s.hw_at_boot === 'switch' ? 'switch' : 'last', allow_subnets4: (s.nets || []).join(' ') }))
 				.then(function(r) { return r.ok === false ? r : self.call('set_failover', { mode: s.failover ? 'auto' : 'off', source: 'gui' }).then(function(r2) { return r2.ok === false ? r2 : r; }); })).then(function() { return self.loadAll(); });
+		},
+		/* messages (ntfy): empty fields keep their current value, a token is never shown again */
+		saveNotify: function() {
+			var self = this, f = self.nsel;
+			var p = f.kind === 'public' ? { public: true } : { server: String(f.server || '').trim(), topic: String(f.topic || '').trim(), fallback_server: String(f.fb_server || '').trim() };
+			if (f.token) p.token = f.token;
+			if (f.fb_token) p.fallback_token = f.fb_token;
+			return self.call('notify_set', p).then(function(r) {
+				if (r.ok === false) { self.say(r.error || T('notify_failed', self.l), true); return; }
+				self.notify = r.notify || null; f.token = ''; f.fb_token = ''; f.topic = '';
+				self.say(T('notify_saved', self.l), false);
+			}).catch(function(e) { self.say(String(e.message || e), true); });
+		},
+		clearNotifyFallback: function() {
+			var self = this;
+			return self.call('notify_set', { clear_fallback: true }).then(function(r) {
+				if (r.ok === false) { self.say(r.error || T('notify_failed', self.l), true); return; }
+				self.notify = r.notify || null; self.nsel.fb_server = ''; self.nsel.fb_token = '';
+				self.say(T('notify_saved', self.l), false);
+			}).catch(function(e) { self.say(String(e.message || e), true); });
+		},
+		testNotify: function() {
+			var self = this;
+			return self.call('notify_test').then(function(r) { self.say(r.ok === false ? (T('notify_failed', self.l) + (r.message ? ' ' + r.message : '')) : T('notify_sent', self.l) + (r.message ? ' ' + r.message : ''), r.ok === false); })
+				.catch(function(e) { self.say(String(e.message || e), true); });
+		},
+		/* statistics of the last 7 days (read-only, from the history the controller keeps) */
+		runReport: function() {
+			var self = this;
+			return self.call('report', { days: '7' }).then(function(r) { self.rep = r.result || null; }).catch(function() { self.rep = null; });
+		},
+		/* leak test of the router's own traffic and rules (read-only; the texts of the single checks come from the router in English) */
+		runLeak: function() {
+			var self = this;
+			self.leakBusy = true;
+			return self.call('leaktest').then(function(r) { self.leak = r.result || null; })
+				.catch(function(e) { self.leak = { result: 'fail', checks: [ { status: 'FAIL', name: 'leaktest', text: String(e.message || e) } ] }; })
+				.then(function() { self.leakBusy = false; });
 		},
 		loadDiag: function() { var self = this; return self.call('diag').then(function(r) { self.diag = (r.diag || []).join('\n'); }).catch(function(e) { self.diag = String(e.message || e); }); },
 		/* public address as seen from outside (myip.wtf, asked by the router, only on this button) */
@@ -401,12 +445,40 @@ return {
 			eg && eg.key && eg.key !== self.pathKey() ? el('div', 'tsem-msg', T('egress_stale', l)) : null,
 			el('div', 'tsem-hint', T('egress_hint', l))
 		]));
+		function fdur(s) { s = Number(s) || 0; var d = Math.floor(s / 86400), hh = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60); return d ? (d + 'd ' + hh + 'h ' + m + 'm') : hh ? (hh + 'h ' + m + 'm') : m ? (m + 'm') : (s + 's'); }
+		var rp = self.rep;
+		kids.push(card(T('report', l), [
+			el('div', 'tsem-actions', [ h('button', { class: 'tsem-btn tsem-ghost', attrs: { id: 'tsem-btn-report', type: 'button' }, on: { click: self.runReport } }, T('report_show', l)) ]),
+			rp ? (rp.tracked > 0 ? el('div', '', [
+				row(T('mode.german', l), fdur(rp.seconds.exit)),
+				row(T('report_backup', l), fdur(rp.seconds.backup)),
+				row('BLOCKED', fdur(rp.seconds.blocked) + ' (' + rp.blocked_episodes + 'x)', rp.seconds.blocked > 0),
+				row('DIRECT', fdur(rp.seconds.direct) + ' (' + rp.direct_episodes + 'x)'),
+				row(T('report_off', l), fdur(rp.seconds.off)),
+				row(T('report_fo', l), String(rp.failovers)),
+				row(T('report_rs', l), String(rp.restarts))
+			]) : el('div', 'tsem-hint', T('report_none', l))) : null,
+			el('div', 'tsem-hint', T('report_hint', l))
+		]));
+		var lk = self.leak;
+		kids.push(card(T('leak', l), [
+			el('div', 'tsem-actions', [ h('button', { class: 'tsem-btn tsem-ghost', attrs: { id: 'tsem-btn-leak', type: 'button', disabled: self.leakBusy ? 'disabled' : null }, on: { click: self.runLeak } }, self.leakBusy ? T('leak_busy', l) : T('leak_run', l)) ]),
+			lk ? el('div', 'tsem-msg' + (lk.result === 'fail' ? ' tsem-msgbad' : ''), T(lk.result === 'pass' ? 'leak_pass' : lk.result === 'warn' ? 'leak_warn' : 'leak_fail', l)) : null,
+			lk ? el('div', '', (lk.checks || []).map(function(c) { return row('[' + c.status + '] ' + c.name, c.text, c.status === 'FAIL'); })) : null,
+			el('div', 'tsem-hint', T('leak_hint', l))
+		]));
 		kids.push(card(T('change_mode', l), [
 			el('div', 'tsem-tiles', [
 				tile('german', 'tsem-btn-german', T('mode.german', l), T('tile.german', l), self.toGerman),
 				tile('direct', 'tsem-btn-direct', T('mode.direct', l), T('tile.direct', l), self.toDirect),
 				tile('blocked', 'tsem-btn-blocked', T('mode.blocked', l), T('tile.blocked', l), self.toBlocked)
 			]),
+			row(T('direct_for', l), h('select', { class: 'tsem-select', attrs: { id: 'tsem-direct-for' }, domProps: { value: self.directFor }, on: { change: function(e) { self.directFor = e.target.value; } } },
+				[ [ '', 'direct_forever' ], [ '15m', 'd15' ], [ '1h', 'd1h' ], [ '4h', 'd4h' ], [ '12h', 'd12h' ] ].map(function(o) { return h('option', { attrs: { value: o[0], selected: self.directFor === o[0] ? 'selected' : null } }, T(o[1], l)); }))),
+			(st && st.direct_until > 0) ? el('div', 'tsem-msg', [
+				el('span', '', T('direct_timer', l).replace('{t}', new Date(st.direct_until * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })).replace('{m}', st.direct_return === 'blocked' ? T('mode.blocked', l) : T('mode.german', l))),
+				h('button', { class: 'tsem-btn tsem-ghost', attrs: { id: 'tsem-btn-keepdirect', type: 'button' }, on: { click: self.keepDirect } }, T('direct_timer_cancel', l))
+			]) : null,
 			el('div', 'tsem-actions', [ h('button', { class: 'tsem-btn tsem-ghost', attrs: { id: 'tsem-btn-failnow', type: 'button', disabled: (self.busy || !(st && st.mode === 'german')) ? 'disabled' : null }, on: { click: self.failNow } }, T('test_failover', l)) ]),
 			el('div', 'tsem-hint', T('test_failover_hint', l))
 		]));
@@ -431,6 +503,29 @@ return {
 			]));
 		}
 
+		function notifyCard() {
+			var n = self.notify || {}, f = self.nsel, pub = f.kind === 'public';
+			function inp(id, key, ph, type) { return h('input', { class: 'tsem-select', attrs: { id: id, type: type || 'text', placeholder: ph || '', autocomplete: 'off' }, domProps: { value: f[key] }, on: { input: function(e) { f[key] = e.target.value; } } }); }
+			var cur = n.configured ? (n.server + (n.fallback_server ? ' + ' + n.fallback_server : '') + (n.token ? ' - ' + T('notify_token_set', l) : '')) : T('notify_off', l);
+			var rows = [
+				row(T('notify_current', l), cur),
+				row(T('notify_kind', l), h('select', { class: 'tsem-select', attrs: { id: 'tsem-nkind' }, domProps: { value: f.kind }, on: { change: function(e) { f.kind = e.target.value; } } }, [
+					h('option', { attrs: { value: 'own', selected: !pub ? 'selected' : null } }, T('notify_own', l)),
+					h('option', { attrs: { value: 'public', selected: pub ? 'selected' : null } }, T('notify_public', l))
+				]))
+			];
+			if (pub) rows.push(el('div', 'tsem-hint tsem-badtxt', T('notify_public_warn', l)));
+			else {
+				rows.push(row(T('notify_server', l), inp('tsem-nserver', 'server', n.configured ? T('notify_keep', l) : 'https://ntfy.example.com')));
+				rows.push(row(T('notify_topic', l), inp('tsem-ntopic', 'topic', n.configured ? T('notify_keep', l) : 'my-long-random-topic')));
+				rows.push(row(T('notify_token', l), inp('tsem-ntoken', 'token', n.token ? T('notify_keep', l) : '', 'password')));
+				rows.push(row(T('notify_fb_server', l), inp('tsem-nfbserver', 'fb_server', n.fallback_server ? T('notify_keep', l) : 'http://192.168.1.10:8098')));
+				rows.push(row(T('notify_fb_token', l), inp('tsem-nfbtoken', 'fb_token', n.fallback_token ? T('notify_keep', l) : '', 'password')));
+			}
+			rows.push(el('div', 'tsem-hint', T('notify_hint', l)));
+			rows.push(el('div', 'tsem-actions', [ btn('tsem-btn-nsave', T('notify_save', l), self.saveNotify, 'tsem-primary'), btn('tsem-btn-ntest', T('notify_test', l), self.testNotify, 'tsem-ghost') ].concat(n.fallback_server ? [ btn('tsem-btn-nclear', T('notify_clear_fb', l), self.clearNotifyFallback, 'tsem-ghost') ] : [])));
+			return card(T('notify', l), rows);
+		}
 		kids.push(timelineCard());
 		kids.push(card(T('settings', l), [
 			row(T('primary', l), picker('tsem-primary', 'primary', false)),
@@ -456,6 +551,7 @@ return {
 			]),
 			el('div', 'tsem-actions', [ btn('tsem-btn-save', T('save', l), self.save, 'tsem-primary') ])
 		]));
+		kids.push(notifyCard());
 		var prm = Logic.paramRows(self.config, l).map(function(r) { return row(r[0], r[1]); });
 		if (prm.length) kids.push(h('details', { class: 'tsem-card' }, [ h('summary', { class: 'tsem-h tsem-sum' }, T('params', l)) ].concat(prm)));
 		kids.push(h('details', { class: 'tsem-card' }, [ h('summary', { class: 'tsem-h tsem-sum' }, T('diag', l)),

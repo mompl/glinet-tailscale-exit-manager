@@ -20,6 +20,12 @@
 #   --ignore-existing-exit-node   install anyway: the existing exit node is cleared when tsem starts in DIRECT (traffic leaves directly)
 #   --admin-subnet NET      keep the router reachable over this private network of a WAN-side link (for example the Wi-Fi uplink of a
 #                           GL-E5800: 10.50.0.0/24) while protected; repeatable (TSEM_ADMIN_SUBNETS4)
+#   --notify-server URL     send messages (state changes) to this ntfy server, for example your own: needs --notify-topic. Without Home Assistant.
+#   --notify-topic NAME     the ntfy topic (on a public server it works like a password: use a long random name)
+#   --notify-token-file F   file (absolute path) with the access token of that server; store it with: tsem-notify token F
+#   --notify-fallback-server URL   second server, tried when the first one does not work (for example your server in the LAN or on the tailnet)
+#   --notify-fallback-token-file F   token file for the second server (default: the one of the first)
+#   --notify-public         use the public server https://ntfy.sh with a random topic (anyone who knows the topic can read the messages)
 #   --report FILE           where to write the report (default /etc/tsem/last-setup-report.txt)
 #   --yes                   never ask; every choice comes from the options
 #   --root DIR              install into DIR (tests)
@@ -34,7 +40,7 @@
 set -u
 umask 022
 HERE=$(cd "$(dirname "$0")" && pwd)
-ROOT=/ YES=0 PRIMARY='' SECONDARY='' SUBNETS='' GERMAN=0 MODE_LABEL='' ACTIVATE=1 KEEP=0 REPORT='' INST_ARGS='' HAVE_SUBNETS=0 DEPS=1 RMRULE=0 ADOPT='' ADMIN='' FALLBACKS=''
+ROOT=/ YES=0 PRIMARY='' SECONDARY='' SUBNETS='' GERMAN=0 MODE_LABEL='' ACTIVATE=1 KEEP=0 REPORT='' INST_ARGS='' HAVE_SUBNETS=0 DEPS=1 RMRULE=0 ADOPT='' ADMIN='' FALLBACKS='' NSRV='' NTOP='' NTKF='' NFSRV='' NFTKF='' NPUB=0
 while [ $# -gt 0 ]; do
 	case $1 in
 	--yes) YES=1; shift ;;
@@ -43,6 +49,12 @@ while [ $# -gt 0 ]; do
 	--allow-subnets) [ $# -ge 2 ] || { echo "--allow-subnets needs a value" >&2; exit 2; }; SUBNETS=$2; HAVE_SUBNETS=1; shift 2 ;;
 	--fallback) [ $# -ge 2 ] || { echo "--fallback needs a value" >&2; exit 2; }; FALLBACKS="${FALLBACKS:+$FALLBACKS }$2"; shift 2 ;;
 	--admin-subnet) [ $# -ge 2 ] || { echo "--admin-subnet needs a value" >&2; exit 2; }; ADMIN="${ADMIN:+$ADMIN }$2"; shift 2 ;;
+	--notify-server) [ $# -ge 2 ] || { echo "--notify-server needs a value" >&2; exit 2; }; NSRV=$2; shift 2 ;;
+	--notify-topic) [ $# -ge 2 ] || { echo "--notify-topic needs a value" >&2; exit 2; }; NTOP=$2; shift 2 ;;
+	--notify-token-file) [ $# -ge 2 ] || { echo "--notify-token-file needs a value" >&2; exit 2; }; NTKF=$2; shift 2 ;;
+	--notify-fallback-server) [ $# -ge 2 ] || { echo "--notify-fallback-server needs a value" >&2; exit 2; }; NFSRV=$2; shift 2 ;;
+	--notify-fallback-token-file) [ $# -ge 2 ] || { echo "--notify-fallback-token-file needs a value" >&2; exit 2; }; NFTKF=$2; shift 2 ;;
+	--notify-public) NPUB=1; shift ;;
 	--exit | --german) GERMAN=1; shift ;;
 	--mode-label) [ $# -ge 2 ] || { echo "--mode-label needs a value" >&2; exit 2; }; MODE_LABEL=$2; shift 2 ;;
 	--no-activate) ACTIVATE=0; shift ;;
@@ -55,7 +67,7 @@ while [ $# -gt 0 ]; do
 		--ignore-existing-exit-node) ADOPT=0; shift ;;
 	--report) [ $# -ge 2 ] || { echo "--report needs a value" >&2; exit 2; }; REPORT=$2; shift 2 ;;
 	--root) [ $# -ge 2 ] || { echo "--root needs a value" >&2; exit 2; }; ROOT=$2; shift 2 ;;
-	-h | --help) sed -n '2,34p' "$0"; exit 0 ;;
+	-h | --help) sed -n '2,40p' "$0"; exit 0 ;;
 	*) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
 	esac
 done
@@ -63,6 +75,8 @@ case $MODE_LABEL in *[!A-Za-z0-9' '_-]*) echo "--mode-label: letters, digits, sp
 [ ${#MODE_LABEL} -le 20 ] || { echo "--mode-label: at most 20 characters" >&2; exit 2; }
 case $SUBNETS in *[!0-9./\ ]*) echo "--allow-subnets: only IPv4 subnets like '10.0.0.0/24 10.0.1.0/24'" >&2; exit 2 ;; esac
 case $ADMIN in *[!0-9./\ ]*) echo "--admin-subnet: only IPv4 networks like 10.50.0.0/24" >&2; exit 2 ;; esac
+if [ "$NPUB" -eq 1 ] && [ -n "$NSRV" ]; then echo "--notify-public and --notify-server exclude each other" >&2; exit 2; fi
+if [ -n "$NSRV$NTOP$NTKF$NFSRV$NFTKF" ] && [ "$NPUB" -eq 0 ] && { [ -z "$NSRV" ] || [ -z "$NTOP" ]; }; then echo "--notify-server and --notify-topic belong together" >&2; exit 2; fi
 [ "$GERMAN" -eq 0 ] || [ "$ACTIVATE" -eq 1 ] || { echo "--german needs the activation (do not combine with --no-activate)" >&2; exit 2; }
 
 R=${ROOT%/}
@@ -371,6 +385,20 @@ conf_put() { # KEY VALUE (quoted)
 }
 if [ -n "$ADMIN" ]; then
 	if conf_put TSEM_ADMIN_SUBNETS4 "$ADMIN"; then ok "the router stays reachable over: $ADMIN"; else fail "could not save the admin networks"; fi
+fi
+# messages without Home Assistant (ntfy): the sender itself validates and writes the file (mode 600)
+if [ "$NPUB" -eq 1 ] || [ -n "$NSRV" ]; then
+	set --
+	if [ "$NPUB" -eq 1 ]; then set -- --public; else set -- --server "$NSRV" --topic "$NTOP"; fi
+	[ -z "$NTKF" ] || set -- "$@" --token-file "$NTKF"
+	[ -z "$NFSRV" ] || set -- "$@" --fallback-server "$NFSRV"
+	[ -z "$NFTKF" ] || set -- "$@" --fallback-token-file "$NFTKF"
+	if _o=$(TSEM_NOTIFY_CONF=$(p /etc/tsem/notify.conf) "${TSEM_NOTIFY_BIN:-$(p /usr/sbin/tsem-notify)}" setup "$@" 2>&1); then
+		ok "messages are configured ($(printf '%s' "$_o" | head -n1)); try it: tsem-notify test"
+		[ "$NPUB" -eq 0 ] || warn "public server ntfy.sh: anyone who knows the topic can read the messages. Show the topic once with: grep NOTIFY_URL /etc/tsem/notify.conf"
+	else
+		warn "messages were not configured: $(printf '%s' "$_o" | head -n1)"
+	fi
 fi
 if [ -z "$MODE_LABEL" ] && interactive; then MODE_LABEL=$(ask "      Name for the exit-node mode shown in the GUI (e.g. Germany, Office VPN)" EXIT); fi
 if [ -n "$MODE_LABEL" ] && [ "$MODE_LABEL" != "$(conf_get TSEM_MODE_LABEL)" ]; then

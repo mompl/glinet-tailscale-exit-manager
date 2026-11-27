@@ -21,9 +21,10 @@ local LIMIT = { allow_subnets4 = 200 }
 
 -- method -> allowed parameter names and their types
 local SPEC = {
-	status = {}, config_get = {}, nodes = {}, subnets = {}, egress = {}, events = {}, diag = {}, failover_now = {},
-	set_mode = { mode = "string", confirm = "boolean" },
+	status = {}, config_get = {}, nodes = {}, subnets = {}, egress = {}, leaktest = {}, report = { days = "string" }, events = {}, diag = {}, failover_now = {}, notify_get = {}, notify_test = {},
+	set_mode = { mode = "string", confirm = "boolean", duration = "string" },
 	set_failover = { mode = "string" },
+	notify_set = { public = "boolean", server = "string", topic = "string", fallback_server = "string", fallback_topic = "string", token = "string", fallback_token = "string", clear_fallback = "boolean", name = "string", events = "string" },
 	config_set = { nodes = "string", node_names = "string", primary = "string", primary_name = "string", secondary = "string", secondary_name = "string", auto_return = "boolean", mode_label = "string", allow_subnets4 = "string", hw_at_boot = "string" },
 }
 

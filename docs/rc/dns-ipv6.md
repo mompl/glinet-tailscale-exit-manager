@@ -28,3 +28,25 @@ Limits, stated plainly:
 
 ## The `0.0.0.0` resolver
 `tsem diag` and `tsem selftest` print the kernel's own answer (`ip route get 0.0.0.0`). Only `local ... dev lo` proves that the address never leaves the router; any other answer is reported as unverified. dnsmasq bound to `0.0.0.0:53` (a listen address, not an upstream) is the usual explanation; it is harmless once the router-own redirect is active.
+
+## Known limitation: a private upstream resolver of the router's own dnsmasq (found on real hardware, v1.2)
+
+If the router's own resolver (dnsmasq on `127.0.0.1`) uses a **private** upstream resolver, typically the router you connect to over Wi-Fi
+(a travel router behind another router, `nameserver 10.x.x.x` in `/tmp/resolv.conf.d/resolv.conf.auto` or `/tmp/resolv.conf.auto`), names do
+**not resolve while the exit mode is active**: the router and the devices that use its resolver get `REFUSED`. Cause (measured on a
+GL-MG1300 behind another router): the query to the private upstream is redirected to `TSEM_DNS_ROUTER`, but its route and source address
+stay on the Wi-Fi uplink, and the kill switch correctly rejects it there. `tsem selftest` warns about such an upstream (`dns-resolver`), and
+`tsem leaktest` reports `router-dns` when the router cannot resolve names. Nothing leaks: the failure is closed, not open. Messages to a
+server **name** fail the same way: use an IP address as the backup address (`NOTIFY_URL_FALLBACK`).
+
+Workaround (measured on the router by pointing the resolver at a public upstream; it works in EXIT, in BLOCKED nothing resolves on purpose):
+give dnsmasq a public upstream instead of the DHCP one, for example
+
+```sh
+uci add_list dhcp.@dnsmasq[0].server='1.1.1.1'
+uci set dhcp.@dnsmasq[0].noresolv='1'
+uci commit dhcp && /etc/init.d/dnsmasq restart
+```
+
+Not verified for every model or firmware: GL.iNet firmware may manage DNS itself, check `nslookup example.org 127.0.0.1` in the exit mode.
+A fix in tsem itself (a redirect that also works for upstreams inside an admin network) is planned.

@@ -38,7 +38,7 @@ on the <a href="https://mompl.github.io/glinet-tailscale-exit-manager/">project 
 Controls: GL.iNet web UI (**APPLICATIONS > Tailscale Exit Manager**), LuCI, the command line (`tsem`), Home Assistant, and the
 physical toggle switch if your router has one (optional).
 
-> **Status (1.1).** Version 1.1 adds an ordered list of up to 8 exit nodes, push messages without Home Assistant (ntfy/webhook), configuration backup/restore and access to the router over a WAN-side admin network (see `CHANGELOG.md`).
+> **Status (1.2).** Version 1.1 added an ordered list of up to 8 exit nodes, push messages without Home Assistant (ntfy/webhook), configuration backup/restore and access to the router over a WAN-side admin network. Version 1.2 adds the choice of your own or the public ntfy server with access tokens, temporary DIRECT (`tsem set direct --for 1h`), a leak test, and statistics with an optional weekly message (see `CHANGELOG.md`).
 
 > **Hardware status.** Tested in network namespaces with real kernel netfilter and on real routers: **GL.iNet GL-MT3000** (firmware 4.11.x) and **GL.iNet GL-MG1300** (firmware 4.11.1) fully; **GL-E5800 (Mudi 7)** installed and checked with a simulated client (experimental, no real Wi-Fi client yet). Other GL.iNet/OpenWrt routers may work (the installer checks the device first and
 > refuses what it does not recognise) but are untested. See `docs/final-report.md` for exactly what has and has not been tested.
@@ -105,6 +105,7 @@ The setup adapts to the router it runs on:
 tsem status           # mode, state, exit node
 tsem set exit         # protected mode (exit node + kill switch)
 tsem set direct       # normal internet
+tsem set direct --for 1h   # normal internet for an hour, then back to where it came from (30m, 2h, 90 = minutes; 1 minute to 24 hours)
 tsem nodes            # exit nodes of your tailnet
 tsem selftest         # checks the installation
 tsem backup | restore # save / restore the settings (no secrets)

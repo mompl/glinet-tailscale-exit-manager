@@ -1,7 +1,7 @@
 # shellcheck shell=sh
 # Common helpers. POSIX sh only (OpenWrt ash / busybox compatible).
 
-TSEM_VERSION=1.1.0
+TSEM_VERSION=1.2.0
 
 : "${TSEM_CONF:=/etc/tsem/tsem.conf}"
 : "${TSEM_STATE_DIR:=/etc/tsem}"     # persistent (flash): intent only
