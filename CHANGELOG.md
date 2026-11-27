@@ -1,8 +1,19 @@
 # Changelog
 
+## 1.2.1
+
+Fixed
+- **Names did not resolve in the exit mode when the router's own resolver used a private upstream behind the uplink** (a travel router behind another router; found on real
+  hardware in 1.2). Cause: dnsmasq binds its upstream sockets to the uplink interface, so the F03 redirect to `TSEM_DNS_ROUTER` could not move the query into the tunnel and the kill
+  switch correctly rejected it there. Now, while a protected mode is active, tsem gives dnsmasq one small temporary file in `/tmp/dnsmasq.d` (RAM only, nothing in `/etc` is touched)
+  with `server=<TSEM_DNS_ROUTER>`; DIRECT, the stop and the uninstall remove it again. New setting `TSEM_DNS_UPSTREAM` = `auto` (default: only when an upstream is private and not
+  reachable through the LAN or the tailnet), `on`, `off`. Switching modes restarts dnsmasq once (a short DNS pause); nothing is opened by this.
+- `tsem selftest` no longer warns about such an upstream when this is handled. The manual `uci` workaround from 1.2.0 is no longer needed (and can be removed).
+
+## 1.2.0
 ## 1.2.0
 
-Known limitation (also in 1.1.0), found on real hardware while testing 1.2
+Known limitation in 1.2.0 (fixed in 1.2.1), found on real hardware while testing 1.2
 - A router whose own resolver (dnsmasq) uses a **private upstream resolver** (a travel router behind another router) cannot resolve names while the exit mode is active; the failure is closed, not open.
   `tsem selftest` and `tsem leaktest` now report it. Workaround and cause in `docs/rc/dns-ipv6.md`; a fix in tsem is planned.
 

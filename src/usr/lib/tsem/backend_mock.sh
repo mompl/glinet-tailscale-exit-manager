@@ -27,6 +27,8 @@ be_guard_set() {
 	[ ! -e "$TSEM_MOCK_DIR/fail_guard" ] || { _mock_ev guard-fail "$1"; return 1; }
 	_mock_ev guard "$1"
 	echo "$1" >"$TSEM_MOCK_DIR/guard"
+	command -v dnsup_sync >/dev/null 2>&1 && dnsup_sync "$1"
+	return 0
 }
 
 be_guard_get() {
@@ -34,7 +36,7 @@ be_guard_get() {
 	cat "$TSEM_MOCK_DIR/guard" 2>/dev/null || echo none
 }
 
-be_guard_remove() { _mock_ev guard-removed; rm -f "$TSEM_MOCK_DIR/guard"; }
+be_guard_remove() { _mock_ev guard-removed; rm -f "$TSEM_MOCK_DIR/guard"; command -v dnsup_sync >/dev/null 2>&1 && dnsup_sync open; return 0; }
 
 be_exit_set() {
 	if [ -e "$TSEM_MOCK_DIR/fail_exit" ] || [ -e "$TSEM_MOCK_DIR/ts_down" ]; then

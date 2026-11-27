@@ -44,6 +44,8 @@ TSEM_LIBDIR=${TSEM_LIBDIR:-/usr/lib/tsem}
 # shellcheck disable=SC1091
 . "$TSEM_LIBDIR/failover.sh"
 # shellcheck disable=SC1091
+. "$TSEM_LIBDIR/dnsup.sh"
+# shellcheck disable=SC1091
 . "$TSEM_LIBDIR/backend.sh"
 
 conf_load
@@ -301,6 +303,7 @@ cmd_tick() {
 	_pr_cur=$FO_CUR
 	lock_release
 	_hourly_tick
+	dnsup_tick "$_mode"
 
 	if [ "$_irc" -ne 0 ]; then
 		log "intent missing/invalid: fail closed (BLOCKED)"
@@ -740,7 +743,7 @@ cmd_diag() {
 	cmd_status || echo "(leak_risk reported)"
 	echo "-- config (no secrets are stored in tsem.conf)"
 	for _k in PRIMARY SECONDARY LAN_IFACES ALLOW_OUT_IFACES TS_IFACE TS_TABLE RT_GUARD RULE_PRIO TAILNET4 TAILNET6 \
-		ALLOW_SUBNETS4 ALLOW_SUBNETS6 DNS_REDIRECT DNS_ROUTER PRIMARY_NAME SECONDARY_NAME OUT_GUARD OUT_LOCAL_IFACES ALLOW_NTP ALLOW_UNDERLAY_DNS UNDERLAY_MARK \
+		ALLOW_SUBNETS4 ALLOW_SUBNETS6 DNS_REDIRECT DNS_ROUTER DNS_UPSTREAM PRIMARY_NAME SECONDARY_NAME OUT_GUARD OUT_LOCAL_IFACES ALLOW_NTP ALLOW_UNDERLAY_DNS UNDERLAY_MARK \
 		INTERVAL INTERVAL_RECOVERY INTERVAL_STEADY INTERVAL_IDLE FAIL_N UP_N RETURN_N DWELL BACKOFF_MIN BACKOFF_MAX; do
 		eval "printf 'TSEM_%s=%s\n' \"$_k\" \"\${TSEM_$_k:-}\""
 	done
@@ -842,7 +845,8 @@ cmd_selftest() {
 			public) _st_pass "dns-resolver" "$_f: $_ns public: follows table 52/exit node in german mode; underlay DNS is rejected by TSEM_OUT" ;;
 			unspecified) if dns_unspec_local; then _st_pass "dns-resolver" "$_f: $_ns (unspecified): the kernel routes it to the local host (dev lo), no path to an external resolver"
 			else _st_warn "dns-resolver" "$_f: $_ns (unspecified address) could not be shown to be local; behaviour UNVERIFIED, see 'tsem diag' and the active DNS test of the acceptance run"; fi ;;
-			private) _st_warn "dns-resolver" "$_f: $_ns (private): reachable only via WAN/LAN unless a subnet route exists; rejected from the router in german mode: if the router's resolver uses it as upstream, names do not resolve while protected (found on a travel router behind another router): use a public upstream, see docs/rc/dns-ipv6.md" ;;
+			private) if [ "$TSEM_DNS_UPSTREAM" != off ] && [ -n "$TSEM_DNS_ROUTER" ] && _dnsup_needed; then _st_pass "dns-resolver" "$_f: $_ns (private, behind the uplink): while protected, tsem gives the router's dnsmasq the upstream $TSEM_DNS_ROUTER (TSEM_DNS_UPSTREAM=$TSEM_DNS_UPSTREAM)"
+			else _st_warn "dns-resolver" "$_f: $_ns (private): reachable only via WAN/LAN unless a subnet route exists; rejected from the router in german mode: if the router's resolver uses it as upstream, names do not resolve while protected (found on a travel router behind another router): use a public upstream, see docs/rc/dns-ipv6.md"; fi ;;
 			esac
 		done
 	done
@@ -936,6 +940,7 @@ cmd_teardown() {
 	lock_acquire
 	be_guard_remove
 	_rc=$?
+	dnsup_sync open
 	fo_reset
 	lock_release
 	return "$_rc"

@@ -15,6 +15,8 @@ t_setup() {
 	export TSEM_BACKEND=mock TSEM_LIBDIR=$ROOT/src/usr/lib/tsem TSEM_CONF=$T/none.conf
 	export TSEM_PRIMARY=$P1 TSEM_SECONDARY=$P2 TSEM_SYSLOG=0 TSEM_SET_TICK_DELAY=0
 	export TSEM_NOW=1790000000 TSEM_LOCK_TIMEOUT=10
+	# the resolver helper must never touch the real system: a directory that does not exist, resolver files of our own
+	export TSEM_DNSMASQ_DIR=$T/no-dnsmasq.d TSEM_RESOLV_FILES=$T/no-resolv TSEM_DNSMASQ_RESTART=/bin/true
 	mkdir -p "$TSEM_STATE_DIR" "$TSEM_RUN_DIR" "$TSEM_MOCK_DIR"
 	trap 'pkill -9 -f "$T/" 2>/dev/null; rm -rf "$T"' EXIT
 }

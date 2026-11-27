@@ -427,6 +427,7 @@ be_guard_set() {
 		_fw_apply "$1" || return 1
 	fi
 	[ "$(be_guard_get)" = "$1" ] || { log "guard verification failed (wanted $1, kernel says $(be_guard_get))"; return 1; }
+	command -v dnsup_sync >/dev/null 2>&1 && dnsup_sync "$1"
 	return 0
 }
 
@@ -449,6 +450,7 @@ be_guard_remove() {
 	_ipt iptables -t nat -X TSEM_DNS_OUT 2>/dev/null
 	_ipt iptables -t nat -F TSEM_DNS 2>/dev/null
 	_ipt iptables -t nat -X TSEM_DNS 2>/dev/null
+	command -v dnsup_sync >/dev/null 2>&1 && dnsup_sync open
 	return 0
 }
 

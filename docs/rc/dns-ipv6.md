@@ -29,7 +29,9 @@ Limits, stated plainly:
 ## The `0.0.0.0` resolver
 `tsem diag` and `tsem selftest` print the kernel's own answer (`ip route get 0.0.0.0`). Only `local ... dev lo` proves that the address never leaves the router; any other answer is reported as unverified. dnsmasq bound to `0.0.0.0:53` (a listen address, not an upstream) is the usual explanation; it is harmless once the router-own redirect is active.
 
-## Known limitation: a private upstream resolver of the router's own dnsmasq (found on real hardware, v1.2)
+## A private upstream resolver of the router's own dnsmasq (found on real hardware in v1.2, fixed in v1.2.1)
+
+**Fixed in 1.2.1:** while a protected mode is active, tsem writes `/tmp/dnsmasq.d/tsem-dns.conf` (`no-resolv`, `server=<TSEM_DNS_ROUTER>`) and restarts dnsmasq once; DIRECT removes the file again. `TSEM_DNS_UPSTREAM` in `tsem.conf`: `auto` (default; only when an upstream is private and not reachable through the LAN or the tailnet), `on`, `off`. The file is in RAM, so a reboot or a crash never leaves a changed resolver behind. The text below describes the problem and the manual workaround for 1.2.0.
 
 If the router's own resolver (dnsmasq on `127.0.0.1`) uses a **private** upstream resolver, typically the router you connect to over Wi-Fi
 (a travel router behind another router, `nameserver 10.x.x.x` in `/tmp/resolv.conf.d/resolv.conf.auto` or `/tmp/resolv.conf.auto`), names do
@@ -49,4 +51,4 @@ uci commit dhcp && /etc/init.d/dnsmasq restart
 ```
 
 Not verified for every model or firmware: GL.iNet firmware may manage DNS itself, check `nslookup example.org 127.0.0.1` in the exit mode.
-A fix in tsem itself (a redirect that also works for upstreams inside an admin network) is planned.
+

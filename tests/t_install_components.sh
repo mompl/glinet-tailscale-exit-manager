@@ -111,7 +111,7 @@ test_upgrade_from_rc3_keeps_config_intent_and_extnet_routes_and_is_reversible() 
 	TSEM_INSTALL_STAMP=20260101-000005 inst --yes --enable || fail "upgrade failed: $(cat "$T/inst.out")"
 	assert_eq conf "$_conf" "$(md5sum <"$RT/etc/tsem/tsem.conf")"
 	assert_eq intent "$_intent" "$(md5sum <"$RT/etc/tsem/intent")"
-	assert_eq version 1.2.0 "$(sed -n 's/^version=//p' "$RT/etc/tsem/install.manifest")"
+	assert_eq version 1.2.1 "$(sed -n 's/^version=//p' "$RT/etc/tsem/install.manifest")"
 	[ -x "$RT/usr/libexec/rpcd/tsem" ] || fail "api missing after upgrade"
 	[ -L "$RT/etc/rc.d/S18tsem" ] || fail "boot link lost"
 	grep -q "10.30.2.0/24" "$RT/etc/tsem/tsem.conf" || fail "remote-site subnets lost"
